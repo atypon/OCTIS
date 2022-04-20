@@ -1,7 +1,6 @@
 """Class to train AVITM models."""
 
 import datetime
-import os
 from collections import defaultdict
 
 import numpy as np
@@ -12,6 +11,9 @@ from torch.utils.data import DataLoader
 
 from octis.models.early_stopping.pytorchtools import EarlyStopping
 from octis.models.pytorchavitm.avitm.decoder_network import DecoderNetwork
+import os, psutil
+
+process = psutil.Process(os.getpid())
 
 
 class AVITM_model(object):
@@ -19,7 +21,8 @@ class AVITM_model(object):
     def __init__(self, input_size, num_topics=10, model_type='prodLDA', hidden_sizes=(100, 100),
                  activation='softplus', dropout=0.2, learn_priors=True, batch_size=64, lr=2e-3, momentum=0.99,
                  solver='adam', num_epochs=100, reduce_on_plateau=False, topic_prior_mean=0.0,
-                 topic_prior_variance=None, num_samples=10, num_data_loader_workers=0, verbose=False):
+                 topic_prior_variance=None, num_samples=10, num_data_loader_workers=0, verbose=False,
+                 save_path='checkpoint.pt'):
         """
         Initialize AVITM model.
 
@@ -90,7 +93,7 @@ class AVITM_model(object):
         self.model = DecoderNetwork(
             input_size, num_topics, model_type, hidden_sizes, activation,
             dropout, learn_priors, topic_prior_mean, topic_prior_variance)
-        self.early_stopping = EarlyStopping(patience=5, verbose=False)
+        self.early_stopping = EarlyStopping(patience=5, verbose=False, path=save_path)
         self.validation_data = None
         # init optimizer
         if self.solver == 'adam':
@@ -146,6 +149,26 @@ class AVITM_model(object):
 
         return loss.sum()
 
+    def _loss2(self, inputs, word_dists, prior_mean, prior_variance,
+               posterior_mean, posterior_variance, posterior_log_variance):
+        # KL term
+        # var division term
+        var_division = torch.sum(posterior_variance / prior_variance, dim=1)
+        # diff means term
+        diff_means = prior_mean - posterior_mean
+        diff_term = torch.sum(
+            (diff_means * diff_means) / prior_variance, dim=1)
+        # logvar det division term
+        logvar_det_division = \
+            prior_variance.log().sum() - posterior_log_variance.sum(dim=1)
+        # combine terms
+        KL = 0.5 * (var_division + diff_term - self.num_topics + logvar_det_division)
+        # Reconstruction term
+        RL = -torch.sum(inputs * torch.log(word_dists + 1e-10), dim=1)
+        loss = KL + RL
+
+        return loss
+
     def _train_epoch(self, loader):
         """Train epoch."""
         self.model.train()
@@ -155,7 +178,7 @@ class AVITM_model(object):
         for batch_samples in loader:
             # batch_size x vocab_size
             x = batch_samples['X']
-
+            x = x.reshape(x.shape[0], -1)
             if self.USE_CUDA:
                 x = x.cuda()
             # forward pass
@@ -187,6 +210,7 @@ class AVITM_model(object):
         for batch_samples in loader:
             # batch_size x vocab_size
             x = batch_samples['X']
+            x = x.reshape(x.shape[0], -1)
 
             if self.USE_CUDA:
                 x = x.cuda()
@@ -250,15 +274,19 @@ class AVITM_model(object):
         for epoch in range(self.num_epochs):
             self.nn_epoch = epoch
             # train epoch
+            print("Epoch: [{}/{}]\tMemory Usage: {:.3f}".format(epoch + 1, self.num_epochs,
+                                                                process.memory_info().rss / (1024 ** 3)))
+
             s = datetime.datetime.now()
             sp, train_loss, topic_words, topic_document = self._train_epoch(train_loader)
             samples_processed += sp
             e = datetime.datetime.now()
 
             # report
-            print("Epoch: [{}/{}]\tSamples: [{}/{}]\tTrain Loss: {}\tTime: {}".format(
+            print("Epoch: [{}/{}]\tSamples: [{}/{}]\tTrain Loss: {}\tTime: {}\tMemory Usage: {:.3f}".format(
                 epoch + 1, self.num_epochs, samples_processed,
-                len(self.train_data) * self.num_epochs, train_loss, e - s))
+                len(self.train_data) * self.num_epochs, train_loss, e - s,
+                process.memory_info().rss / (1024 ** 3)))
 
             self.best_components = self.model.beta
             self.final_topic_word = topic_words
@@ -274,9 +302,10 @@ class AVITM_model(object):
                 e = datetime.datetime.now()
 
                 # report
-                print("Epoch: [{}/{}]\tSamples: [{}/{}]\tValidation Loss: {}\tTime: {}".format(
-                    epoch + 1, self.num_epochs, val_samples_processed,
-                    len(self.validation_data) * self.num_epochs, val_loss, e - s))
+                print("Epoch: [{}/{}]\tSamples: [{}/{}]\tTrain Loss: {}\tTime: {}\tMemory Usage: {:.3f}".format(
+                    epoch + 1, self.num_epochs, samples_processed,
+                    len(self.train_data) * self.num_epochs, train_loss, e - s,
+                    process.memory_info().rss / (1024 ** 3)))
 
                 if np.isnan(val_loss) or np.isnan(train_loss):
                     break
@@ -288,14 +317,16 @@ class AVITM_model(object):
                             self.save(save_dir)
                         break
 
-    def predict(self, dataset):
+    def predict(self, dataset, rec_bow, test_bow, results_dir=None):
         """Predict input."""
         self.model.eval()
+        # print("Evaluation: \tTest size: {}\tMemory Usage: {:.3f}".format(len(dataset.X),
+        #                                                                  process.memory_info().rss / (1024 ** 3)))
 
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False,
                             num_workers=self.num_data_loader_workers)
 
-        topic_document_mat = []
+        perplexity = None
         with torch.no_grad():
             for batch_samples in loader:
                 # batch_size x vocab_size
@@ -305,13 +336,62 @@ class AVITM_model(object):
                     x = x.cuda()
                 # forward pass
                 self.model.zero_grad()
-                _, _, _, _, _, _, _, topic_document = self.model(x)
-                topic_document_mat.append(topic_document)
 
-        results = self.get_info()
-        # results['test-topic-document-matrix2'] = np.vstack(
-        #    np.asarray([i.cpu().detach().numpy() for i in topic_document_mat])).T
-        results['test-topic-document-matrix'] = np.asarray(self.get_thetas(dataset)).T
+                prior_mean, prior_var, posterior_mean, posterior_var, posterior_log_var, \
+                word_dists, topic_words, topic_document = self.model(x)
+
+                # backward pass
+                loss = self._loss2(x, word_dists, prior_mean, prior_var,
+                                   posterior_mean, posterior_var, posterior_log_var)
+                if perplexity is None:
+                    perplexity = loss
+                else:
+                    perplexity = np.concatenate((perplexity, loss), axis=0)
+
+        loader_bow = DataLoader(rec_bow, batch_size=self.batch_size, shuffle=False,
+                                num_workers=self.num_data_loader_workers)
+        loader_test_bow = DataLoader(test_bow, batch_size=self.batch_size, shuffle=False,
+                                     num_workers=self.num_data_loader_workers)
+
+        word_perplexity = None
+        with torch.no_grad():
+            for batch_samples, test_samples in zip(loader_bow, loader_test_bow):
+                # batch_size x vocab_size
+                x = batch_samples['X']
+                x = x.reshape(x.shape[0], -1)
+                if self.USE_CUDA:
+                    x = x.cuda()
+                # forward pass
+                self.model.zero_grad()
+                _, _, _, _, _, word_dists, _, _ = self.model(x)
+
+                inputs = test_samples['X']
+                inputs = inputs.reshape(x.shape[0], -1)
+                if self.USE_CUDA:
+                    inputs = inputs.cuda()
+
+                RL = -torch.sum(inputs * torch.log(word_dists + 1e-10), dim=1)
+
+                if word_perplexity is None:
+                    word_perplexity = RL
+                else:
+                    word_perplexity = np.concatenate((word_perplexity, RL), axis=0)
+
+        results = self.get_info(results_dir)
+
+        try:
+            if not os.path.exists(results_dir):
+                os.makedirs(results_dir, exist_ok=False)
+            np.savetxt(os.path.join(results_dir, 'test-topic-document-matrix.txt'),
+                       np.asarray(self.get_thetas(dataset)).T)
+            np.savetxt(os.path.join(results_dir, 'doc-losses.txt'), perplexity)
+            np.savetxt(os.path.join(results_dir, 'word-losses.txt'), word_perplexity)
+        except:
+
+            print("Could not create output directory: {}".format(results_dir))
+            results['test-topic-document-matrix'] = np.asarray(self.get_thetas(dataset)).T
+            results['doc-losses'] = perplexity
+            results['word-losses'] = word_perplexity
 
         return results
 
@@ -345,17 +425,28 @@ class AVITM_model(object):
 
         return topics_list
 
-    def get_info(self):
+    def get_info(self, results_dir=None):
         info = {}
-        topic_word = self.get_topics()
-        topic_word_dist = self.get_topic_word_mat()
-        # topic_document_dist = self.get_topic_document_mat()
-        info['topics'] = topic_word
 
-        # info['topic-document-matrix2'] = topic_document_dist.T
-        info['topic-document-matrix'] = np.asarray(self.get_thetas(self.train_data)).T
+        if results_dir is not None:
+            try:
+                if not os.path.exists(results_dir):
+                    os.makedirs(results_dir, exist_ok=False)
 
-        info['topic-word-matrix'] = topic_word_dist
+                np.savetxt(os.path.join(results_dir, 'topics.txt'), np.array(self.get_topics()), fmt='%s')
+
+                np.savetxt(os.path.join(results_dir, 'topic-word-matrix.txt'), self.get_topic_word_mat())
+                del self.final_topic_word
+
+                topic_document_matrix = np.asarray(self.get_thetas(self.train_data)).T
+                np.savetxt(os.path.join(results_dir, 'topic_document_matrix.txt'), topic_document_matrix)
+                del topic_document_matrix
+
+            except:
+                print("Could not create output directory: {}".format(results_dir))
+                info['topics'] = self.get_topics()
+                info['topic-document-matrix'] = np.asarray(self.get_thetas(self.train_data)).T
+                info['topic-word-matrix'] = self.get_topic_word_mat()
         return info
 
     def _format_file(self):
@@ -413,7 +504,7 @@ class AVITM_model(object):
 
         loader = DataLoader(
             dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_data_loader_workers)
-        final_thetas = []
+        final_thetas = None
         for sample_index in range(self.num_samples):
             with torch.no_grad():
                 collect_theta = []
@@ -427,5 +518,8 @@ class AVITM_model(object):
                     self.model.zero_grad()
                     collect_theta.extend(self.model.get_theta(x).cpu().numpy().tolist())
 
-                final_thetas.append(np.array(collect_theta))
-        return np.sum(final_thetas, axis=0) / self.num_samples
+                if final_thetas is None:
+                    final_thetas = np.array(collect_theta)
+                else:
+                    final_thetas = final_thetas + np.array(collect_theta)
+        return final_thetas / self.num_samples

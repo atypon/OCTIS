@@ -2,7 +2,7 @@
 
 import torch
 from torch.utils.data import Dataset
-
+import scipy.sparse
 
 class BOWDataset(Dataset):
 
@@ -21,10 +21,13 @@ class BOWDataset(Dataset):
 
     def __len__(self):
         """Return length of dataset."""
-        return len(self.X)
+        return self.X.shape[0]
 
     def __getitem__(self, i):
         """Return sample from dataset at index i."""
-        X = torch.FloatTensor(self.X[i])
+        if type(self.X[i]) == scipy.sparse.csr.csr_matrix:
+            X = torch.FloatTensor(self.X[i].todense())
+        else:
+            X = torch.FloatTensor(self.X[i])
 
         return {'X': X}

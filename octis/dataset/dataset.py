@@ -14,7 +14,8 @@ class Dataset:
     Dataset handles a dataset and offers methods to access, save and edit the dataset data
     """
 
-    def __init__(self, corpus=None, vocabulary=None, labels=None, metadata=None, document_indexes=None):
+    def __init__(self, corpus=None, vocabulary=None, labels=None, covariates=None, metadata=None,
+                 document_indexes=None):
         """
         Initialize a dataset, parameters are optional
         if you want to load a dataset, initialize this
@@ -30,6 +31,7 @@ class Dataset:
         self.__vocabulary = vocabulary
         self.__metadata = metadata
         self.__labels = labels
+        self.__covariates = covariates
         self.__original_indexes = document_indexes
         self.dataset_path = None
         self.is_cached = False
@@ -77,6 +79,31 @@ class Dataset:
         else:
             return [self.__corpus]
 
+    def get_split_indices(self, use_validation=False):
+        train_indices = None
+        test_indices = None
+        valid_indices = None
+        if "last-training-doc" in self.__metadata:
+            last_training_doc = self.__metadata["last-training-doc"]
+            if use_validation:
+                last_validation_doc = self.__metadata["last-validation-doc"]
+                if self.__corpus is not None and last_training_doc != 0:
+                    train_indices = list(range(0, last_training_doc))
+                    valid_indices = list(range(last_training_doc, last_validation_doc))
+                    test_indices = list(range(last_validation_doc, len(self.__corpus)))
+            else:
+                if self.__corpus is not None and last_training_doc != 0:
+                    if "last-validation-doc" in self.__metadata.keys():
+                        last_validation_doc = self.__metadata["last-validation-doc"]
+                    else:
+                        last_validation_doc = 0
+
+                    train_indices = list(range(0, last_training_doc))
+                    if last_validation_doc != 0:
+                        test_indices = list(range(last_validation_doc, len(self.__corpus)))
+                    else:
+                        test_indices = list(range(last_training_doc, len(self.__corpus)))
+        return train_indices, test_indices, valid_indices
 
     # Edges getter
     def get_edges(self):
@@ -85,6 +112,10 @@ class Dataset:
     # Labels getter
     def get_labels(self):
         return self.__labels
+
+    # Covariates getter
+    def get_covariates(self):
+        return self.__covariates
 
     # Metadata getter
     def get_metadata(self):
@@ -205,6 +236,20 @@ class Dataset:
                 labels = [json.loads(line.strip()) for line in labels_file]
             self.__labels = labels
 
+    def _load_covariates(self, file_name):
+        """
+        Loads covariates from a file
+        Parameters
+        ----------
+        file_name : name of the file to read
+        ----------
+        """
+        file = Path(file_name)
+        if file.is_file():
+            with open(file_name, 'r') as covariates_file:
+                covariates = [json.loads(line.strip()) for line in covariates_file]
+            self.__covariates = covariates
+
     def _save_vocabulary(self, file_name):
         """
         Saves vocabulary dictionary in a file
@@ -299,8 +344,11 @@ class Dataset:
                 labs = [' '.join(lab) for lab in self.__labels]
             else:
                 labs = self.__labels
+
+            covars = labs = [' '.join(lab) for lab in self.__covariates]
+
             if self.__labels:
-                df = pd.concat([df, pd.DataFrame(labs)], axis=1)
+                df = pd.concat([df, pd.DataFrame(labs), pd.DataFrame(covars)], axis=1)
             df.to_csv(path + '/corpus.tsv', sep='\t', index=False, header=False)
 
             self._save_vocabulary(path + "/vocabulary.txt")
@@ -326,7 +374,7 @@ class Dataset:
                 self.__metadata = dict()
             df = pd.read_csv(self.dataset_path + "/corpus.tsv", sep='\t', header=None)
             if len(df.keys()) > 1:
-                #just make sure docs are sorted in the right way (train - val - test)
+                # just make sure docs are sorted in the right way (train - val - test)
                 final_df = df[df[1] == 'train'].append(df[df[1] == 'val'])
                 final_df = final_df.append(df[df[1] == 'test'])
                 self.__metadata['last-training-doc'] = len(final_df[final_df[1] == 'train'])
@@ -398,4 +446,4 @@ class Dataset:
         self.__metadata = cache["metadata"]
         self.dataset_path = cache_path
         self.__labels = cache["labels"]
-
+        self.__covariates = cache["covariates"]

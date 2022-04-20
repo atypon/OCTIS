@@ -1,13 +1,17 @@
+import re
 import string
 from typing import List, Union
 
 import spacy
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.model_selection import train_test_split
 from tqdm.contrib.concurrent import process_map  # or thread_map
 from pathlib import Path
 from octis.dataset.dataset import Dataset
 from collections import Counter
+import pandas as pd
+
+import utils.file_handling as fh
 
 """
 Maps the language to its corresponding spacy model
@@ -18,15 +22,20 @@ spacy_model_mapping = {'chinese': 'zh_core_web_sm', 'danish': 'nl_core_news_sm',
                        'lithuanian': 'lt_core_news_sm', 'norwegian': 'nb_core_news_sm', 'polish': 'pl_core_news_sm',
                        'portuguese': 'pt_core_news_sm', 'romanian': 'ro_core_news_sm', 'russian': 'ru_core_news_sm',
                        'spanish': 'es_core_news_sm'}
+UNKNOWN_TOKEN = "<UNK>"
 
 
 class Preprocessing:
     def __init__(self, lowercase: bool = True, vocabulary: List[str] = None, max_features: int = None,
                  min_df: float = 0.0, max_df: float = 1.0, remove_punctuation: bool = True,
-                 punctuation: str = string.punctuation, remove_numbers: bool = True, lemmatize: bool = True,
-                 stopword_list: Union[str, List[str]] = None, min_chars: int = 1, min_words_docs: int = 0,
-                 language: str = 'english', split: bool = True, verbose: bool = False, num_processes: int = None,
-                 save_original_indexes=True, remove_stopwords_spacy: bool = True):
+                 punctuation: str = string.punctuation, remove_numbers: bool = True,
+                 lemmatize: bool = True, stopword_list: Union[str, List[str]] = None, min_chars: int = 1,
+                 min_words_docs: int = 0, language: str = 'english', split: bool = True, verbose: bool = False,
+                 num_processes: int = None, save_original_indexes=True, remove_stopwords_spacy: bool = True,
+                 labels: List[str] = None, covariates: List[str] = None,
+                 min_label_count: int = None, min_covars_count: int = None,
+                 max_label_count: int = None, max_covars_count: int = None,
+                 remove_alphanum: bool = True, strip_html: bool = True, ):
         """
         init Preprocessing
 
@@ -93,7 +102,6 @@ class Preprocessing:
                                                            "following command:\npython -m spacy download " + lang)
         self.split = split
         self.verbose = verbose
-
         self.remove_stopwords_spacy = remove_stopwords_spacy
 
         stopwords = []
@@ -120,118 +128,201 @@ class Preprocessing:
         self.min_doc_words = min_words_docs
         self.preprocessing_steps = []
 
-    def preprocess_dataset(self, documents_path, labels_path=None, multilabel=False):
+        # TODO:: add documentation
+        self.labels = labels
+        self.covariates = covariates
+        self.min_label_count = min_label_count
+        self.max_label_count = max_label_count
+        self.min_covars_count = min_covars_count
+        self.max_covars_count = max_covars_count
+        self.remove_alphanum = remove_alphanum
+        self.strip_html = strip_html
+
+    def preprocess_dataset(self, documents_path):
         """
         preprocess the input dataset
 
         :param documents_path: path to the documents file. Each row of the file represents a document
         :type documents_path: str
-        :param labels_path: path to the documents file. Each row of the file represents a label. Its index corresponds
-        to the index of the documents file (default: None)
-        :type labels_path: str
-        :param multilabel: if true, a document is supposed to have more than one label (labels are split by whitespace)
-        :type multilabel: bool
 
         :return octis.dataset.dataset.Dataset
         """
-        docs = [line.strip() for line in open(documents_path, 'r').readlines()]
+
+        documents = pd.DataFrame.from_records(fh.read_jsonlist(documents_path))
+
+        # Filter Labels and Covariates based on frequency limits of labels/covariates
+        labels, covariates = None, None
+        if self.labels:
+            labels = self.read_labels_list(documents, self.labels)
+        if self.covariates:
+            covariates = self.read_labels_list(documents, self.covariates)
+
+        ids, docs = documents['id'].tolist(), documents['text'].tolist()
+        if labels:
+            docs, labels, filtered_ids = self.filter_labels(labels, docs, ids, self.min_label_count,
+                                                            self.max_label_count, filter_none=True)
+            if covariates:
+                ids, covariates = zip(*[(x, y) for x, y in zip(ids, covariates) if x in filtered_ids])
+                ids, covariates = list(ids), list(covariates)
+        if covariates:
+            _, covariates, _ = self.filter_labels(covariates, docs, ids,
+                                                  self.min_covars_count, self.max_covars_count, filter_none=False)
+
+        # Clean text
         if self.num_processes is not None:
-            # with Pool(self.num_processes) as p:
-            #    docs = p.map(self.simple_preprocessing_steps, docs)
-            docs = process_map(self.simple_preprocessing_steps, docs, max_workers=self.num_processes, chunksize=1)
+            documents['text'] = process_map(self.simple_preprocessing_steps, documents['text'].tolist(),
+                                            max_workers=self.num_processes, chunksize=1)
         else:
-            docs = self.simple_preprocessing_steps(docs)
-        if self.lowercase:
-            self.preprocessing_steps.append("lowercase")
-        if self.remove_punctuation:
-            self.preprocessing_steps.append('remove_punctuation')
-        if self.lemmatize:
-            self.preprocessing_steps.append('lemmatize')
+            documents['text'] = self.simple_preprocessing_steps(documents['text'].tolist())
 
+        # Filter Vocabulary
         vocabulary = self.filter_words(docs)
-        print("created vocab")
-        # with Pool(self.num_processes) as p:
-        #    final_docs, final_labels = p.starmap(self._foo, product(docs, vocabulary, labels_path, repeat=2))
-        print(len(vocabulary))
-        final_docs, final_labels, document_indexes = [], [], []
-        if labels_path is not None:
-            if multilabel:
-                labels = [line.strip().split() for line in open(labels_path, 'r').readlines()]
-            else:
-                labels = [line.strip() for line in open(labels_path, 'r').readlines()]
+        vocab = set(vocabulary)
+        print(f"created vocab: {len(vocab)}")
+        docs = [' '.join([w for w in doc.split() if w in vocab]) for doc in docs]
+        docs = [doc for doc in docs if len(doc) > self.min_doc_words]
 
-            for i, doc, label in zip(range(len(docs)), docs, labels):
-                vocab = set(vocabulary)
-                new_doc = [w for w in doc.split() if w in vocab]
-                if len(new_doc) > self.min_doc_words:
-                    final_docs.append(new_doc)
-                    final_labels.append(label)
-                    document_indexes.append(i)
-
-            labels_to_remove = set([k for k, v in dict(Counter(final_labels)).items() if v <= 3])
-            if len(labels_to_remove) > 0:
-                docs = final_docs
-                labels = final_labels
-                document_indexes, final_labels, final_docs = [], [], []
-                for i, doc, label in zip(range(len(docs)), docs, labels):
-                    if label not in labels_to_remove:
-                        final_docs.append(doc)
-                        final_labels.append(label)
-                        document_indexes.append(i)
-        else:
-            for i, doc in enumerate(docs):
-                vocab = set(vocabulary)
-                new_doc = [w for w in doc.split() if w in vocab]
-                if len(new_doc) > self.min_doc_words:
-                    final_docs.append(new_doc)
-                    document_indexes.append(i)
-
-        self.preprocessing_steps.append('filter documents with less than ' + str(self.min_doc_words) + " words")
         if self.verbose:
             print("words filtering done")
         metadata = {"total_documents": len(docs), "vocabulary_length": len(vocabulary),
-                    "preprocessing-info": self.preprocessing_steps
-                    # ,"labels": list(set(final_labels)), "total_labels": len(set(final_labels))
-                    }
+                    "preprocessing-info": self.preprocessing_steps}
         if self.split:
-            if len(final_labels) > 0:
-                train, test, y_train, y_test = train_test_split(
-                    range(len(final_docs)), final_labels, test_size=0.15, random_state=1, shuffle=True)#stratify=final_labels)
+            # if labels or covariates:
+            #     if len(labels) > 0 and len(covariates) > 0:
+            #         train, test, y_train, y_test, c_train, c_test = train_test_split(
+            #             range(len(docs)), labels, covariates, test_size=0.15, random_state=1, shuffle=True)
+            #         train, validation, y_train, y_validation, c_train, c_validation = train_test_split(
+            #             train, y_train, c_train, test_size=3 / 17, random_state=1, shuffle=True)
+            #
+            #     elif len(labels) > 0:
+            #         train, test, y_train, y_test = train_test_split(
+            #             range(len(docs)), covariates, test_size=0.15, random_state=1, shuffle=True)
+            #         train, validation, y_train, y_validation = train_test_split(
+            #             train, y_train, test_size=3 / 17, random_state=1, shuffle=True)
+            #
+            #     elif len(covariates) > 0:
+            #         train, test, c_train, c_test = train_test_split(
+            #             range(len(docs)), covariates, test_size=0.15, random_state=1, shuffle=True)
+            #         train, validation, c_train, c_validate = train_test_split(
+            #             train, c_train, test_size=3 / 17, random_state=1, shuffle=True)
+            #
+            #     partitioned_covariates = None
+            #     partitioned_labels = None
+            #     partitioned_corpus = None
+            #
+            #     if covariates:
+            #         partitioned_covariates = [covariates[c] for c in c_train + c_validation + c_test]
+            #     if labels:
+            #         partitioned_labels = [labels[l] for l in y_train + y_validation + y_test]
+            #
+            #
+            #     partitioned_corpus = [docs[doc] for doc in train + validation + test]
+            #     document_indexes = [document_indexes[doc] for doc in partitioned_corpus]
+            #
+            #     metadata["last-training-doc"] = len(train)
+            #     metadata["last-validation-doc"] = len(validation) + len(train)
+            #     if self.save_original_indexes:
+            #         return Dataset(partitioned_corpus, vocabulary=vocabulary,
+            #                        metadata=metadata, labels=partitioned_labels, covariates=partitioned_covariates,
+            #                        document_indexes=document_indexes)
+            #     else:
+            #         return Dataset(partitioned_corpus, vocabulary=vocabulary,
+            #                        metadata=metadata, labels=partitioned_labels, covariates=partitioned_covariates)
+            # else:
+            partitioned_docs = None
+            partitioned_covariates = None
+            partitioned_labels = None
 
-                train, validation = train_test_split(train, test_size=3 / 17, random_state=1, shuffle=True)# stratify=y_train)
+            train, test = train_test_split(range(len(docs)), test_size=0.15, random_state=1)
+            train, validation = train_test_split(train, test_size=3 / 17, random_state=1)
 
-                partitioned_labels = [final_labels[doc] for doc in train + validation + test]
-                partitioned_corpus = [final_docs[doc] for doc in train + validation + test]
-                document_indexes = [document_indexes[doc] for doc in train + validation + test]
-                metadata["last-training-doc"] = len(train)
-                metadata["last-validation-doc"] = len(validation) + len(train)
-                if self.save_original_indexes:
-                    return Dataset(partitioned_corpus, vocabulary=vocabulary, metadata=metadata,
-                                   labels=partitioned_labels, document_indexes=document_indexes)
-                else:
-                    return Dataset(partitioned_corpus, vocabulary=vocabulary, metadata=metadata,
-                                   labels=partitioned_labels)
-            else:
-                train, test = train_test_split(range(len(final_docs)), test_size=0.15, random_state=1)
-                train, validation = train_test_split(train, test_size=3 / 17, random_state=1)
+            metadata["last-training-doc"] = len(train)
+            metadata["last-validation-doc"] = len(validation) + len(train)
+            partitioned_docs = [docs[doc].split() for doc in train + validation + test]
+            document_indexes = [ids[doc] for doc in train + validation + test]
 
-                metadata["last-training-doc"] = len(train)
-                metadata["last-validation-doc"] = len(validation) + len(train)
-                partitioned_corpus = [final_docs[doc] for doc in train + validation + test]
-                document_indexes = [document_indexes[doc] for doc in train + validation + test]
-                if self.save_original_indexes:
-                    return Dataset(partitioned_corpus, vocabulary=vocabulary, metadata=metadata, labels=final_labels,
-                                   document_indexes=document_indexes)
-                else:
-                    return Dataset(partitioned_corpus, vocabulary=vocabulary, metadata=metadata, labels=final_labels,
-                                   document_indexes=document_indexes)
-        else:
+            if labels:
+                partitioned_labels = [labels[doc] for doc in train + validation + test]
+
+            if covariates:
+                partitioned_covariates = [covariates[doc] for doc in train + validation + test]
+
             if self.save_original_indexes:
-                return Dataset(final_docs, vocabulary=vocabulary, metadata=metadata, labels=final_labels,
-                               document_indexes=document_indexes)
+                return Dataset(partitioned_docs, vocabulary=vocabulary, metadata=metadata, labels=partitioned_labels,
+                               covariates=partitioned_covariates, document_indexes=document_indexes)
+            else:
+                return Dataset(partitioned_docs, vocabulary=vocabulary, metadata=metadata, labels=partitioned_labels,
+                               covariates=partitioned_covariates)
+        else:
+            docs = [doc.split() for doc in docs]
+            if self.save_original_indexes:
+                return Dataset(docs, vocabulary=vocabulary, metadata=metadata, labels=labels, covariates=covariates,
+                               document_indexes=ids)
             else:
 
-                return Dataset(final_docs, vocabulary=vocabulary, metadata=metadata, labels=final_labels)
+                return Dataset(docs, vocabulary=vocabulary, metadata=metadata, labels=labels, covariates=covariates)
+
+    def read_labels_list(self, documents, labels_names):
+        labels_list = {}
+        if type(labels_names) == str:
+            if ',' in labels_names:
+                labels_names = labels_names.split(',')
+            else:
+                labels_names = [labels_names]
+        if type(labels_names) == list:
+            for l in labels_names:
+                if l in documents.columns:
+                    labels = documents[l].tolist()
+                    updated_labels = []
+                    for x in labels:
+                        if type(x) == list:
+                            updated_labels.append([str(y) for y in x])
+                        else:
+                            updated_labels.append([str(x)])
+                    labels_list[l] = updated_labels
+        all_labels = list(map(list, zip(*[labels_list[k] for k in sorted(labels_list)])))
+        final_labels = []
+        for labels in all_labels:
+            temp_labels = []
+            for l in labels:
+                temp_labels.extend(l)
+            temp_labels = [str(l).lower() for l in temp_labels if l]
+            final_labels.append(temp_labels)
+        return final_labels
+
+
+    def filter_labels(self, labels, docs, ids, min_label_count=None, max_label_count=None, filter_none=False):
+        final_docs, final_labels, document_indexes = [], [], []
+        labels_to_remove = set()
+        if min_label_count:
+            all_labels = [x.lower() for y in labels for x in y]
+            labels_to_remove = set([k for k, v in dict(Counter(all_labels)).items() if v <= min_label_count])
+
+        elif max_label_count:
+            label_vectorizer = CountVectorizer(max_features=max_label_count, stop_words=self.stopwords)
+            all_labels = [x.lower() for y in labels for x in y]
+            label_vectorizer.fit_transform(all_labels)
+            u_labels = set(label_vectorizer.get_feature_names())
+            labels_to_remove = list(set(all_labels).difference(set(u_labels)))
+
+        if len(labels_to_remove) > 0:
+            for i, doc, label in zip(ids, docs, labels):
+                doc_final_labels = []
+                for l in label:
+                    if l not in labels_to_remove:
+                        doc_final_labels.append(l)
+                # if doc_final_labels:
+                if filter_none and not doc_final_labels:
+                    pass
+                else:
+                    final_docs.append(doc)
+                    final_labels.append(doc_final_labels)
+                    document_indexes.append(i)
+        else:
+            final_docs = docs
+            final_labels = labels
+            document_indexes = ids
+        return final_docs, final_labels, document_indexes
 
     def filter_words(self, docs):
         if self.vocabulary is not None:
@@ -239,7 +330,7 @@ class Preprocessing:
             self.preprocessing_steps.append('filter words with document frequency lower than ' + str(self.min_df) +
                                             ' and higher than ' + str(self.max_df))
             self.preprocessing_steps.append('filter words with less than ' + str(self.min_chars) + " character")
-            vectorizer = TfidfVectorizer(df_max_freq=self.max_df, df_min_freq=self.min_df, vocabulary=self.vocabulary,
+            vectorizer = CountVectorizer(max_df=self.max_df, min_df=self.min_df, vocabulary=self.vocabulary,
                                          token_pattern=r"(?u)\b\w{" + str(self.min_chars) + ",}\b",
                                          lowercase=self.lowercase, stop_words=self.stopwords)
 
@@ -249,18 +340,18 @@ class Preprocessing:
                                             ' and higher than ' + str(self.max_df))
             self.preprocessing_steps.append('filter words with less than ' + str(self.min_chars) + " character")
             # we ignore df_max_freq e df_min_freq because self.max_features is not None
-            vectorizer = TfidfVectorizer(lowercase=self.lowercase, max_features=self.max_features,
+            vectorizer = CountVectorizer(lowercase=self.lowercase, max_features=self.max_features,
                                          stop_words=self.stopwords,
                                          token_pattern=r"(?u)\b[\w|\-]{" + str(self.min_chars) + r",}\b")
 
         else:
 
-            #string.punctuation
+            # string.punctuation
 
             self.preprocessing_steps.append('filter words with document frequency lower than ' + str(self.min_df) +
                                             ' and higher than ' + str(self.max_df))
             self.preprocessing_steps.append('filter words with less than ' + str(self.min_chars) + " character")
-            vectorizer = TfidfVectorizer(max_df=self.max_df, min_df=self.min_df, lowercase=self.lowercase,
+            vectorizer = CountVectorizer(max_df=self.max_df, min_df=self.min_df, lowercase=self.lowercase,
                                          token_pattern=r"(?u)\b[\w|\-]{" + str(self.min_chars) + r",}\b",
                                          stop_words=self.stopwords)
 
@@ -268,33 +359,34 @@ class Preprocessing:
         vocabulary = vectorizer.get_feature_names()
         return vocabulary
 
-    '''
-    def _foo(self, docs, vocabulary, labels_path):
-        final_docs, final_labels = [], []
-        if labels_path is not None:
-            labels = [line.strip() for line in open(labels_path, 'r').readlines()]
-            for doc, label in zip(docs, labels):
-                new_doc = [w for w in doc.split() if w in set(vocabulary)]
-                if len(new_doc) > self.min_doc_words:
-                    final_docs.append(new_doc)
-                    final_labels.append(label)
-            return final_docs, final_labels
-        else:
-            for doc in docs:
-                new_doc = [w for w in doc.split() if w in set(vocabulary)]
-                if len(new_doc) > self.min_doc_words:
-                    final_docs.append(new_doc)
-            return final_docs, []
-    '''
+    def clean_text(self, text):
+        text = text.replace("\\", " ")
+        text = text.replace("/", " ")
+        text = text.replace("-", " ")
+        text = text.replace("–", " ")
+        text = text.replace('\n', '')
+        text = text.replace('\t', '')
+        text = text.translate(str.maketrans('', '', string.punctuation)).strip()
+        replace_by_space_re = re.compile('[\n\"\'`/(){}\[\]\|@,;#]')
+        text = re.sub(replace_by_space_re, ' ', text)
+        text = re.sub(' +', ' ', text)
+        text = text.strip()
+        return text
 
     def simple_preprocessing_steps(self, docs):
         tmp_docs = []
         for d in docs:
             new_d = d
-            new_d = new_d.replace('\n', '')
-            new_d = new_d.replace('\t', '')
+            if self.strip_html:
+                new_d = re.sub(r'<[^>]+>', '', new_d)
+            else:
+                # replace angle brackets
+                new_d = re.sub(r'<', '(', new_d)
+                new_d = re.sub(r'>', ')', new_d)
+
             if self.lowercase:
                 new_d = new_d.lower()
+
             if self.lemmatize:
                 if self.remove_stopwords_spacy:
                     new_d = ' '.join([token.lemma_ for token in self.spacy_model(new_d) if not token.is_stop])
@@ -303,11 +395,17 @@ class Preprocessing:
                         [token.lemma_ for token in self.spacy_model(new_d) if token.lemma_ not in set(self.stopwords)])
                 else:
                     new_d = ' '.join([token.lemma_ for token in self.spacy_model(new_d)])
+            else:
+                if self.stopwords:
+                    new_d = ' '.join([w for w in new_d.split() if len(w) > 2 and w not in self.stopwords])
 
             if self.remove_punctuation:
                 new_d = new_d.translate(str.maketrans(self.punctuation, ' ' * len(self.punctuation)))
+
             if self.remove_numbers:
                 new_d = new_d.translate(str.maketrans("0123456789", ' ' * len("0123456789")))
+
+            new_d = self.clean_text(new_d)
             new_d = " ".join(new_d.split())
             tmp_docs.append(new_d)
         return tmp_docs

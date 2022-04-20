@@ -11,7 +11,7 @@ class AVITM(AbstractModel):
                  dropout=0.2, learn_priors=True, batch_size=64, lr=2e-3, momentum=0.99,
                  solver='adam', num_epochs=100, reduce_on_plateau=False, prior_mean=0.0,
                  prior_variance=None, num_layers=2, num_neurons=100, num_samples=10,
-                 use_partitions=True):
+                 use_partitions=True, save_path='checkpoint.pt'):
         """
             :param num_topics : int, number of topic components, (default 10)
             :param model_type : string, 'prodLDA' or 'LDA' (default 'prodLDA')
@@ -45,12 +45,13 @@ class AVITM(AbstractModel):
         self.hyperparameters["num_neurons"] = num_neurons
         self.hyperparameters["num_layers"] = num_layers
         self.hyperparameters["num_samples"] = num_samples
+        self.hyperparameters["save_path"] = save_path
 
         hidden_sizes = tuple([num_neurons for _ in range(num_layers)])
         self.use_partitions = use_partitions
         self.hyperparameters['hidden_sizes'] = tuple(hidden_sizes)
 
-    def train_model(self, dataset, hyperparameters=None, top_words=10):
+    def train_model(self, dataset, hyperparameters=None, top_words=10, results_dir=None):
         """
             :param dataset: list of sentences for training the model
             :param hyperparameters: dict, with the below information:
@@ -81,7 +82,7 @@ class AVITM(AbstractModel):
             data_corpus_validation = [' '.join(i) for i in validation]
 
             self.vocab = dataset.get_vocabulary()
-            x_train, x_test, x_valid, input_size = \
+            x_train, x_test, x_bow_fh, x_test_sh, x_valid, input_size = \
                 self.preprocess(self.vocab, data_corpus_train, test=data_corpus_test,
                                 validation=data_corpus_validation)
         else:
@@ -89,6 +90,7 @@ class AVITM(AbstractModel):
             data_corpus = [' '.join(i) for i in dataset.get_corpus()]
             x_train, input_size = self.preprocess(self.vocab, train=data_corpus)
 
+        del dataset
         self.model = avitm_model.AVITM_model(
             input_size=input_size, num_topics=self.hyperparameters['num_topics'],
             model_type=self.hyperparameters['model_type'], hidden_sizes=self.hyperparameters['hidden_sizes'],
@@ -98,12 +100,13 @@ class AVITM(AbstractModel):
             solver=self.hyperparameters['solver'], num_epochs=self.hyperparameters['num_epochs'],
             reduce_on_plateau=self.hyperparameters['reduce_on_plateau'], num_samples=self.hyperparameters[
                 'num_samples'], topic_prior_mean=self.hyperparameters["prior_mean"],
-            topic_prior_variance=self.hyperparameters["prior_variance"]
+            topic_prior_variance=self.hyperparameters["prior_variance"],
+            save_path=self.hyperparameters["save_path"]
         )
 
         if self.use_partitions:
             self.model.fit(x_train, x_valid)
-            result = self.inference(x_test)
+            result = self.inference(x_test, x_bow_fh, x_test_sh, results_dir)
         else:
             self.model.fit(x_train, None)
             result = self.model.get_info()
@@ -142,16 +145,16 @@ class AVITM(AbstractModel):
         self.hyperparameters['hidden_sizes'] = tuple(
             [self.hyperparameters["num_neurons"] for _ in range(self.hyperparameters["num_layers"])])
 
-    def inference(self, x_test):
+    def inference(self, x_test, x_bow_fh, x_test_sh, results_dir=None):
         assert isinstance(self.use_partitions, bool) and self.use_partitions
-        results = self.model.predict(x_test)
+        results = self.model.predict(x_test, x_bow_fh, x_test_sh, results_dir)
         return results
 
     def partitioning(self, use_partitions=False):
         self.use_partitions = use_partitions
 
-    @staticmethod
-    def preprocess(vocab, train, test=None, validation=None):
+    @classmethod
+    def preprocess(cls, vocab, train, test=None, validation=None):
         vocab2id = {w: i for i, w in enumerate(vocab)}
         vec = CountVectorizer(vocabulary=vocab2id, token_pattern=r'(?u)\b\w+\b')
         entire_dataset = train.copy()
@@ -163,22 +166,47 @@ class AVITM(AbstractModel):
         vec.fit(entire_dataset)
         idx2token = {v: k for (k, v) in vec.vocabulary_.items()}
         X_train = vec.transform(train)
-        train_data = datasets.BOWDataset(X_train.toarray(), idx2token)
+        train_data = datasets.BOWDataset(X_train, idx2token)
         input_size = len(idx2token.keys())
 
         if test is not None and validation is not None:
             x_test = vec.transform(test)
-            test_data = datasets.BOWDataset(x_test.toarray(), idx2token)
+            test_data = datasets.BOWDataset(x_test, idx2token)
             x_valid = vec.transform(validation)
-            valid_data = datasets.BOWDataset(x_valid.toarray(), idx2token)
-            return train_data, test_data, valid_data, input_size
+            valid_data = datasets.BOWDataset(x_valid, idx2token)
+
+            test_list = [t.split(' ') for t in test]
+            # train_bow, test_bow = cls.split_bow(test_list, random_seed=1, ratio=0.5)
+            train_bow = [' '.join([t[x] for x in range(0, len(t), 2)]) for t in test_list]
+            test_bow = [' '.join([t[x] for x in range(1, len(t), 2)]) for t in test_list]
+
+            test_fh_bow = vec.transform(train_bow)
+            test_sh_bow = vec.transform(test_bow)
+
+            test_fh_bow = datasets.BOWDataset(test_fh_bow, idx2token)
+            test_sh_bow = datasets.BOWDataset(test_sh_bow, idx2token)
+
+            return train_data, test_data, test_fh_bow, test_sh_bow, valid_data, input_size
         if test is None and validation is not None:
             x_valid = vec.transform(validation)
-            valid_data = datasets.BOWDataset(x_valid.toarray(), idx2token)
+            valid_data = datasets.BOWDataset(x_valid, idx2token)
             return train_data, valid_data, input_size
         if test is not None and validation is None:
             x_test = vec.transform(test)
-            test_data = datasets.BOWDataset(x_test.toarray(), idx2token)
-            return train_data, test_data, input_size
+            test_data = datasets.BOWDataset(x_test, idx2token)
+
+            test_list = [t.split(' ') for t in test]
+            # train_bow, test_bow = cls.split_bow(test_list, random_seed=1, ratio=0.5)
+            train_bow = [' '.join([t[x] for x in range(0, len(t), 2)]) for t in test_list]
+            test_bow = [' '.join([t[x] for x in range(1, len(t), 2)]) for t in test_list]
+
+            test_fh_bow = vec.transform(train_bow)
+            test_sh_bow = vec.transform(test_bow)
+
+            test_fh_bow = datasets.BOWDataset(test_fh_bow, idx2token)
+            test_sh_bow = datasets.BOWDataset(test_sh_bow, idx2token)
+
+            return train_data, test_data, test_fh_bow, test_sh_bow, input_size
+
         if test is None and validation is None:
             return train_data, input_size
