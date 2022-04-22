@@ -22,7 +22,7 @@ class AVITM_model(object):
                  activation='softplus', dropout=0.2, learn_priors=True, batch_size=64, lr=2e-3, momentum=0.99,
                  solver='adam', num_epochs=100, reduce_on_plateau=False, topic_prior_mean=0.0,
                  topic_prior_variance=None, num_samples=10, num_data_loader_workers=0, verbose=False,
-                 save_path='checkpoint.pt'):
+                 save_dir='checkpoint.pt'):
         """
         Initialize AVITM model.
 
@@ -93,7 +93,7 @@ class AVITM_model(object):
         self.model = DecoderNetwork(
             input_size, num_topics, model_type, hidden_sizes, activation,
             dropout, learn_priors, topic_prior_mean, topic_prior_variance)
-        self.early_stopping = EarlyStopping(patience=5, verbose=False, path=save_path)
+        self.early_stopping = EarlyStopping(patience=5, verbose=False, path=save_dir)
         self.validation_data = None
         # init optimizer
         if self.solver == 'adam':
@@ -447,6 +447,10 @@ class AVITM_model(object):
                 info['topics'] = self.get_topics()
                 info['topic-document-matrix'] = np.asarray(self.get_thetas(self.train_data)).T
                 info['topic-word-matrix'] = self.get_topic_word_mat()
+        else:
+            info['topics'] = self.get_topics()
+            info['topic-document-matrix'] = np.asarray(self.get_thetas(self.train_data)).T
+            info['topic-word-matrix'] = self.get_topic_word_mat()
         return info
 
     def _format_file(self):

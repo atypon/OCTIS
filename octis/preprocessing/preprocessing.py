@@ -78,8 +78,16 @@ class Preprocessing:
         :type verbose: bool
         :param num_processes: number of processes to run the preprocessing
         :type num_processes: int
-        :param save_original_indexes: if true, it keeps track of the original indexes of the documents
+        :param labels: list of labels associated with each document (optional, comma-separated)
+        :param covariates: list of covariates associated with each document (optional, comma-separated)
+        :param min_label_count: int , exclude labels that occur in less than this number of documents
+        :param max_label_count: int, the max number of labels to be kept based on their document frequency
+        :param min_covars_count: int, exclude covariates that occur in less than this number of documents
+        :param max_covars_count:int, the max number of covariates to be kept based on their document frequency
+        :param remove_alphanum: bool, if true remove tokens made of a mixture of letters and numbers
+        :param strip_html: bool, if true, Strip HTML tags
         """
+
         self.vocabulary = vocabulary
         self.lowercase = lowercase
         self.max_features = max_features
@@ -128,7 +136,6 @@ class Preprocessing:
         self.min_doc_words = min_words_docs
         self.preprocessing_steps = []
 
-        # TODO:: add documentation
         self.labels = labels
         self.covariates = covariates
         self.min_label_count = min_label_count
@@ -289,7 +296,6 @@ class Preprocessing:
             temp_labels = [str(l).lower() for l in temp_labels if l]
             final_labels.append(temp_labels)
         return final_labels
-
 
     def filter_labels(self, labels, docs, ids, min_label_count=None, max_label_count=None, filter_none=False):
         final_docs, final_labels, document_indexes = [], [], []

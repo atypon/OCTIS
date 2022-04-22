@@ -11,7 +11,7 @@ class AVITM(AbstractModel):
                  dropout=0.2, learn_priors=True, batch_size=64, lr=2e-3, momentum=0.99,
                  solver='adam', num_epochs=100, reduce_on_plateau=False, prior_mean=0.0,
                  prior_variance=None, num_layers=2, num_neurons=100, num_samples=10,
-                 use_partitions=True, save_path='checkpoint.pt'):
+                 use_partitions=True, save_dir='checkpoint.pt'):
         """
             :param num_topics : int, number of topic components, (default 10)
             :param model_type : string, 'prodLDA' or 'LDA' (default 'prodLDA')
@@ -45,7 +45,7 @@ class AVITM(AbstractModel):
         self.hyperparameters["num_neurons"] = num_neurons
         self.hyperparameters["num_layers"] = num_layers
         self.hyperparameters["num_samples"] = num_samples
-        self.hyperparameters["save_path"] = save_path
+        self.hyperparameters["save_dir"] = save_dir
 
         hidden_sizes = tuple([num_neurons for _ in range(num_layers)])
         self.use_partitions = use_partitions
@@ -101,7 +101,7 @@ class AVITM(AbstractModel):
             reduce_on_plateau=self.hyperparameters['reduce_on_plateau'], num_samples=self.hyperparameters[
                 'num_samples'], topic_prior_mean=self.hyperparameters["prior_mean"],
             topic_prior_variance=self.hyperparameters["prior_variance"],
-            save_path=self.hyperparameters["save_path"]
+            save_dir=self.hyperparameters["save_dir"]
         )
 
         if self.use_partitions:

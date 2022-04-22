@@ -1,0 +1,17 @@
+data:
+  max_features: 2000 #Vocabulary Size
+  max_labels: 100 # Pick top n labels in labelled dataset
+parameters:
+  model_type: Scholar #It can be one of the following [CTM, SuperCTM, ProdLDA, Scholar, NVDM]
+  num_topics: [20] #For dblp dataset
+  epochs: 3 #This is just for our example
+  runs: 2 #Number of model training runs
+bert_model:
+  training:  embeddings/dblp_bert_13k_vocab.pkl
+  testing:  embeddings/dblp_bert_test_13k_vocab.pkl
+input:
+  dataset_path:
+output:
+  save_path: checkpoint/ProdLDA.checkpoint_6000_w.pt
+  model_output: output/ProdLDA_w_6000_t_50_l_100/
+
