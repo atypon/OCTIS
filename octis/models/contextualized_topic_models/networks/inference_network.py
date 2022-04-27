@@ -5,12 +5,12 @@ from torch import nn
 import torch
 import numpy as np
 
-class ContextualInferenceNetwork(nn.Module):
 
+class ContextualInferenceNetwork(nn.Module):
     """Inference Network."""
 
     def __init__(self, input_size, bert_size, output_size, hidden_sizes,
-                 activation='softplus', dropout=0.2):
+                 activation='softplus', dropout=0.2, label_size=0):
         """
         Initialize InferenceNetwork.
 
@@ -54,7 +54,7 @@ class ContextualInferenceNetwork(nn.Module):
         elif activation == 'selu':
             self.activation = nn.SELU()
 
-        self.input_layer = nn.Linear(input_size+input_size, hidden_sizes[0])
+        self.input_layer = nn.Linear(input_size + label_size, hidden_sizes[0])
         self.adapt_bert = nn.Linear(bert_size, hidden_sizes[0])
 
         self.hiddens = nn.Sequential(OrderedDict([
@@ -69,11 +69,16 @@ class ContextualInferenceNetwork(nn.Module):
 
         self.dropout_enc = nn.Dropout(p=self.dropout)
 
-    def forward(self, x, x_bert):
+    def forward(self, x, x_bert, labels=None):
         """Forward pass."""
-        x_bert = self.adapt_bert(x_bert)
 
-        x = self.activation(x_bert)
+        x = x_bert
+        if labels:
+            x = torch.cat((x_bert, labels), 1)
+
+        x = self.input_layer(x)
+
+        x = self.activation(x)
         x = self.hiddens(x)
         x = self.dropout_enc(x)
         mu = self.f_mu_batchnorm(self.f_mu(x))
@@ -83,11 +88,10 @@ class ContextualInferenceNetwork(nn.Module):
 
 
 class CombinedInferenceNetwork(nn.Module):
-
     """Inference Network."""
 
     def __init__(self, input_size, bert_size, output_size, hidden_sizes,
-                 activation='softplus', dropout=0.2):
+                 activation='softplus', dropout=0.2, label_size=0):
         """
         Initialize InferenceNetwork.
 
@@ -132,7 +136,7 @@ class CombinedInferenceNetwork(nn.Module):
         elif activation == 'selu':
             self.activation = nn.SELU()
 
-        self.input_layer = nn.Linear(input_size+input_size, hidden_sizes[0])
+        self.input_layer = nn.Linear(input_size + input_size + label_size, hidden_sizes[0])
         self.adapt_bert = nn.Linear(bert_size, input_size)
         self.bert_layer = nn.Linear(hidden_sizes[0], hidden_sizes[0])
 
@@ -148,12 +152,15 @@ class CombinedInferenceNetwork(nn.Module):
 
         self.dropout_enc = nn.Dropout(p=self.dropout)
 
-    def forward(self, x, x_bert):
+    def forward(self, x, x_bert, labels=None):
         """Forward pass."""
         x_bert = self.adapt_bert(x_bert)
         x = torch.cat((x, x_bert), 1)
-        x = self.input_layer(x)
 
+        if labels is not None:
+            x = torch.cat((x, labels), 1)
+
+        x = self.input_layer(x)
         x = self.activation(x)
         x = self.hiddens(x)
         x = self.dropout_enc(x)

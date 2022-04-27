@@ -147,26 +147,6 @@ class AVITM_model(object):
         RL = -torch.sum(inputs * torch.log(word_dists + 1e-10), dim=1)
         loss = KL + RL
 
-        return loss.sum()
-
-    def _loss2(self, inputs, word_dists, prior_mean, prior_variance,
-               posterior_mean, posterior_variance, posterior_log_variance):
-        # KL term
-        # var division term
-        var_division = torch.sum(posterior_variance / prior_variance, dim=1)
-        # diff means term
-        diff_means = prior_mean - posterior_mean
-        diff_term = torch.sum(
-            (diff_means * diff_means) / prior_variance, dim=1)
-        # logvar det division term
-        logvar_det_division = \
-            prior_variance.log().sum() - posterior_log_variance.sum(dim=1)
-        # combine terms
-        KL = 0.5 * (var_division + diff_term - self.num_topics + logvar_det_division)
-        # Reconstruction term
-        RL = -torch.sum(inputs * torch.log(word_dists + 1e-10), dim=1)
-        loss = KL + RL
-
         return loss
 
     def _train_epoch(self, loader):
@@ -181,16 +161,17 @@ class AVITM_model(object):
             x = x.reshape(x.shape[0], -1)
             if self.USE_CUDA:
                 x = x.cuda()
+
             # forward pass
             self.model.zero_grad()
             prior_mean, prior_var, posterior_mean, posterior_var, posterior_log_var, \
             word_dists, topic_words, topic_document = self.model(x)
-
             topic_doc_list.extend(topic_document)
 
             # backward pass
             loss = self._loss(x, word_dists, prior_mean, prior_var,
                               posterior_mean, posterior_var, posterior_log_var)
+            loss = loss.sum()
             loss.backward()
             self.optimizer.step()
 
@@ -221,7 +202,7 @@ class AVITM_model(object):
 
             loss = self._loss(x, word_dists, prior_mean, prior_var,
                               posterior_mean, posterior_var, posterior_log_var)
-
+            loss = loss.sum()
             # compute train loss
             samples_processed += x.size()[0]
             val_loss += loss.item()
@@ -288,6 +269,7 @@ class AVITM_model(object):
                 len(self.train_data) * self.num_epochs, train_loss, e - s,
                 process.memory_info().rss / (1024 ** 3)))
 
+            # TODO :: whats the difference between best_components and final_topic_word
             self.best_components = self.model.beta
             self.final_topic_word = topic_words
             self.final_topic_document = topic_document
@@ -317,15 +299,13 @@ class AVITM_model(object):
                             self.save(save_dir)
                         break
 
-    def predict(self, dataset, rec_bow, test_bow, results_dir=None):
-        """Predict input."""
+    def _doc_perplexity(self, dataset):
         self.model.eval()
         # print("Evaluation: \tTest size: {}\tMemory Usage: {:.3f}".format(len(dataset.X),
         #                                                                  process.memory_info().rss / (1024 ** 3)))
 
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False,
                             num_workers=self.num_data_loader_workers)
-
         perplexity = None
         with torch.no_grad():
             for batch_samples in loader:
@@ -341,18 +321,20 @@ class AVITM_model(object):
                 word_dists, topic_words, topic_document = self.model(x)
 
                 # backward pass
-                loss = self._loss2(x, word_dists, prior_mean, prior_var,
-                                   posterior_mean, posterior_var, posterior_log_var)
+                loss = self._loss(x, word_dists, prior_mean, prior_var,
+                                  posterior_mean, posterior_var, posterior_log_var)
                 if perplexity is None:
                     perplexity = loss
                 else:
                     perplexity = np.concatenate((perplexity, loss), axis=0)
+        return perplexity
 
+    def _word_perplexity(self, rec_bow, test_bow):
         loader_bow = DataLoader(rec_bow, batch_size=self.batch_size, shuffle=False,
                                 num_workers=self.num_data_loader_workers)
         loader_test_bow = DataLoader(test_bow, batch_size=self.batch_size, shuffle=False,
                                      num_workers=self.num_data_loader_workers)
-
+        self.model.eval()
         word_perplexity = None
         with torch.no_grad():
             for batch_samples, test_samples in zip(loader_bow, loader_test_bow):
@@ -376,23 +358,21 @@ class AVITM_model(object):
                     word_perplexity = RL
                 else:
                     word_perplexity = np.concatenate((word_perplexity, RL), axis=0)
+        return word_perplexity
 
-        results = self.get_info(results_dir)
+    def get_info(self):
+        info = {}
+        info['topics'] = self.get_topics()
+        info['topic-document-matrix'] = np.asarray(self.get_thetas(self.train_data)).T
+        info['topic-word-matrix'] = self.get_topic_word_mat()
+        return info
 
-        try:
-            if not os.path.exists(results_dir):
-                os.makedirs(results_dir, exist_ok=False)
-            np.savetxt(os.path.join(results_dir, 'test-topic-document-matrix.txt'),
-                       np.asarray(self.get_thetas(dataset)).T)
-            np.savetxt(os.path.join(results_dir, 'doc-losses.txt'), perplexity)
-            np.savetxt(os.path.join(results_dir, 'word-losses.txt'), word_perplexity)
-        except:
-
-            print("Could not create output directory: {}".format(results_dir))
-            results['test-topic-document-matrix'] = np.asarray(self.get_thetas(dataset)).T
-            results['doc-losses'] = perplexity
-            results['word-losses'] = word_perplexity
-
+    def predict(self, dataset, rec_bow, test_bow):
+        """Predict input."""
+        results = self.get_info()
+        results['test-topic-document-matrix'] = np.asarray(self.get_thetas(dataset)).T
+        results['doc-losses'] = self._doc_perplexity(dataset)
+        results['word-losses'] = self._word_perplexity(rec_bow, test_bow)
         return results
 
     def get_topic_word_mat(self):
@@ -424,34 +404,6 @@ class AVITM_model(object):
                 topics_list.append(component_words)
 
         return topics_list
-
-    def get_info(self, results_dir=None):
-        info = {}
-
-        if results_dir is not None:
-            try:
-                if not os.path.exists(results_dir):
-                    os.makedirs(results_dir, exist_ok=False)
-
-                np.savetxt(os.path.join(results_dir, 'topics.txt'), np.array(self.get_topics()), fmt='%s')
-
-                np.savetxt(os.path.join(results_dir, 'topic-word-matrix.txt'), self.get_topic_word_mat())
-                del self.final_topic_word
-
-                topic_document_matrix = np.asarray(self.get_thetas(self.train_data)).T
-                np.savetxt(os.path.join(results_dir, 'topic_document_matrix.txt'), topic_document_matrix)
-                del topic_document_matrix
-
-            except:
-                print("Could not create output directory: {}".format(results_dir))
-                info['topics'] = self.get_topics()
-                info['topic-document-matrix'] = np.asarray(self.get_thetas(self.train_data)).T
-                info['topic-word-matrix'] = self.get_topic_word_mat()
-        else:
-            info['topics'] = self.get_topics()
-            info['topic-document-matrix'] = np.asarray(self.get_thetas(self.train_data)).T
-            info['topic-word-matrix'] = self.get_topic_word_mat()
-        return info
 
     def _format_file(self):
         model_dir = "AVITM_nc_{}_tpm_{}_tpv_{}_hs_{}_ac_{}_do_{}_lr_{}_mo_{}_rp_{}". \

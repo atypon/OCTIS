@@ -15,7 +15,7 @@ class scholar:
                  num_epochs=100, init_mult=0.001, device=torch.device('cpu'),
                  classifier_layers=0, use_interactions=False, l1_topics=1.0, l1_topic_covars=1.0,
                  l1_interactions=1.0, l2_prior_covars=0.0, embedding_dim=300, use_partitions=True,
-                 w2v=None, alpha=1.0, no_bg=False, seed=None, covars_predict=False):
+                 w2v=None, alpha=1.0, no_bg=False, seed=None, covars_predict=False, save_dir=None):
 
         self.hyperparameters = {}
         self.hyperparameters['num_topics'] = num_topics
@@ -159,32 +159,34 @@ class scholar:
                                     test_X, test_labels, test_prior_covars, test_topic_covars,
                                     test_fh_X, test_sh_X, batch_size=200, eta_bn_prop=1.0)
         else:
-            self.train(network_architecture, train_X, train_prior_covars, train_topic_covars,
+            self.train(network_architecture, train_X, train_labels, train_prior_covars, train_topic_covars,
                        training_epochs=self.hyperparameters['num_epochs'])
-            result = self.inference(train_X, train_labels, train_prior_covars, train_topic_covars, test_X,
-                                    test_fh_X, test_sh_X)
+            result = self.inference(train_X, train_labels, train_prior_covars, train_topic_covars)
         return result
 
     def inference(self, train_X, train_labels, train_prior_covars, train_topic_covars,
-                  test_X, test_labels, test_prior_covars, test_topic_covars,
-                  test_bow_fh, test_bow_sh, batch_size, eta_bn_prop):
-        assert isinstance(self.use_partitions, bool) and self.use_partitions
+                  test_X=None, test_labels=None, test_prior_covars=None, test_topic_covars=None,
+                  test_bow_fh=None, test_bow_sh=None, batch_size=200, eta_bn_prop=1.0):
+
+        # assert isinstance(self.use_partitions, bool) and self.use_partitions
         results = {}
         topic_word = self.model.get_weights()
         results['topics'] = self.get_top_topics(topic_word, self.vocab, k=10)
         results['topic-document-matrix'] = self.get_doc_representaion(train_X, train_labels, train_prior_covars,
                                                                       train_topic_covars)
-        results['test-topic-document-matrix'] = self.get_doc_representaion(test_X, test_labels, test_prior_covars,
-                                                                           test_topic_covars)
         results['topic-word-matrix'] = topic_word
 
-        self.model.eval()
-        results['doc-losses'] = evaluate_perplexity(self.model, test_X, test_labels, test_prior_covars,
-                                                    test_topic_covars, batch_size, eta_bn_prop=eta_bn_prop)
+        if test_X is not None:
+            results['test-topic-document-matrix'] = self.get_doc_representaion(test_X, test_labels, test_prior_covars,
+                                                                               test_topic_covars)
 
-        results['word-losses'] = evaluate_word_perplexity(self.model, test_bow_fh, test_bow_sh,
-                                                          test_labels, test_prior_covars, test_topic_covars,
-                                                          batch_size, eta_bn_prop=eta_bn_prop)
+            self.model.eval()
+            results['doc-losses'] = evaluate_perplexity(self.model, test_X, test_labels, test_prior_covars,
+                                                        test_topic_covars, batch_size, eta_bn_prop=eta_bn_prop)
+
+            results['word-losses'] = evaluate_word_perplexity(self.model, test_bow_fh, test_bow_sh,
+                                                              test_labels, test_prior_covars, test_topic_covars,
+                                                              batch_size, eta_bn_prop=eta_bn_prop)
 
         return results
 
@@ -197,7 +199,8 @@ class scholar:
             batch_xs, batch_ys, batch_pcs, batch_tcs = get_minibatch(X, Y, PC, TC, i, batch_size)
             thetas.append(self.model.compute_theta(batch_xs, batch_ys, batch_pcs, batch_tcs))
         theta = np.vstack(thetas)
-        return theta
+
+        return theta.T
 
     def get_top_topics(self, beta, feature_names, k=10, sparsity_threshold=1e-5):
         topics = []

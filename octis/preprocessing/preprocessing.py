@@ -156,37 +156,47 @@ class Preprocessing:
         """
 
         documents = pd.DataFrame.from_records(fh.read_jsonlist(documents_path))
+        ids, docs, labels, covariates = documents['id'].tolist(), documents['text'].tolist(), None, None
 
-        # Filter Labels and Covariates based on frequency limits of labels/covariates
-        labels, covariates = None, None
+        # Read Labels and Covariates
         if self.labels:
             labels = self.read_labels_list(documents, self.labels)
         if self.covariates:
             covariates = self.read_labels_list(documents, self.covariates)
 
-        ids, docs = documents['id'].tolist(), documents['text'].tolist()
+        # Filter Labels and Covariates based on frequency limits of labels/covariates
         if labels:
-            docs, labels, filtered_ids = self.filter_labels(labels, docs, ids, self.min_label_count,
-                                                            self.max_label_count, filter_none=True)
+            docs, labels, filtered_ids = self.filter_labels(labels, docs, ids,
+                                                            self.min_label_count,
+                                                            self.max_label_count,
+                                                            filter_none=True)
             if covariates:
                 ids, covariates = zip(*[(x, y) for x, y in zip(ids, covariates) if x in filtered_ids])
                 ids, covariates = list(ids), list(covariates)
+            else:
+                ids = filtered_ids
+
         if covariates:
             _, covariates, _ = self.filter_labels(covariates, docs, ids,
-                                                  self.min_covars_count, self.max_covars_count, filter_none=False)
-
+                                                  self.min_covars_count,
+                                                  self.max_covars_count,
+                                                  filter_none=False)
         # Clean text
         if self.num_processes is not None:
-            documents['text'] = process_map(self.simple_preprocessing_steps, documents['text'].tolist(),
-                                            max_workers=self.num_processes, chunksize=1)
+            docs = process_map(self.simple_preprocessing_steps, docs, max_workers=self.num_processes, chunksize=1)
         else:
-            documents['text'] = self.simple_preprocessing_steps(documents['text'].tolist())
+            docs = self.simple_preprocessing_steps(docs)
 
         # Filter Vocabulary
         vocabulary = self.filter_words(docs)
         vocab = set(vocabulary)
         print(f"created vocab: {len(vocab)}")
         docs = [' '.join([w for w in doc.split() if w in vocab]) for doc in docs]
+        ids = [j for i, j in enumerate(ids) if len(docs[i]) > self.min_doc_words]
+        if labels:
+            labels = [j for i, j in enumerate(labels) if len(docs[i]) > self.min_doc_words]
+        if covariates:
+            covariates = [j for i, j in enumerate(covariates) if len(docs[i]) > self.min_doc_words]
         docs = [doc for doc in docs if len(doc) > self.min_doc_words]
 
         if self.verbose:
@@ -194,48 +204,6 @@ class Preprocessing:
         metadata = {"total_documents": len(docs), "vocabulary_length": len(vocabulary),
                     "preprocessing-info": self.preprocessing_steps}
         if self.split:
-            # if labels or covariates:
-            #     if len(labels) > 0 and len(covariates) > 0:
-            #         train, test, y_train, y_test, c_train, c_test = train_test_split(
-            #             range(len(docs)), labels, covariates, test_size=0.15, random_state=1, shuffle=True)
-            #         train, validation, y_train, y_validation, c_train, c_validation = train_test_split(
-            #             train, y_train, c_train, test_size=3 / 17, random_state=1, shuffle=True)
-            #
-            #     elif len(labels) > 0:
-            #         train, test, y_train, y_test = train_test_split(
-            #             range(len(docs)), covariates, test_size=0.15, random_state=1, shuffle=True)
-            #         train, validation, y_train, y_validation = train_test_split(
-            #             train, y_train, test_size=3 / 17, random_state=1, shuffle=True)
-            #
-            #     elif len(covariates) > 0:
-            #         train, test, c_train, c_test = train_test_split(
-            #             range(len(docs)), covariates, test_size=0.15, random_state=1, shuffle=True)
-            #         train, validation, c_train, c_validate = train_test_split(
-            #             train, c_train, test_size=3 / 17, random_state=1, shuffle=True)
-            #
-            #     partitioned_covariates = None
-            #     partitioned_labels = None
-            #     partitioned_corpus = None
-            #
-            #     if covariates:
-            #         partitioned_covariates = [covariates[c] for c in c_train + c_validation + c_test]
-            #     if labels:
-            #         partitioned_labels = [labels[l] for l in y_train + y_validation + y_test]
-            #
-            #
-            #     partitioned_corpus = [docs[doc] for doc in train + validation + test]
-            #     document_indexes = [document_indexes[doc] for doc in partitioned_corpus]
-            #
-            #     metadata["last-training-doc"] = len(train)
-            #     metadata["last-validation-doc"] = len(validation) + len(train)
-            #     if self.save_original_indexes:
-            #         return Dataset(partitioned_corpus, vocabulary=vocabulary,
-            #                        metadata=metadata, labels=partitioned_labels, covariates=partitioned_covariates,
-            #                        document_indexes=document_indexes)
-            #     else:
-            #         return Dataset(partitioned_corpus, vocabulary=vocabulary,
-            #                        metadata=metadata, labels=partitioned_labels, covariates=partitioned_covariates)
-            # else:
             partitioned_docs = None
             partitioned_covariates = None
             partitioned_labels = None
@@ -254,39 +222,56 @@ class Preprocessing:
             if covariates:
                 partitioned_covariates = [covariates[doc] for doc in train + validation + test]
 
+            unprocessed_docs = documents[documents['id'].isin(document_indexes)]['text'].tolist()
             if self.save_original_indexes:
-                return Dataset(partitioned_docs, vocabulary=vocabulary, metadata=metadata, labels=partitioned_labels,
+                return Dataset(partitioned_docs, raw_corpus=unprocessed_docs, vocabulary=vocabulary, metadata=metadata,
+                               labels=partitioned_labels,
                                covariates=partitioned_covariates, document_indexes=document_indexes)
             else:
-                return Dataset(partitioned_docs, vocabulary=vocabulary, metadata=metadata, labels=partitioned_labels,
+                return Dataset(partitioned_docs, raw_corpus=unprocessed_docs, vocabulary=vocabulary, metadata=metadata,
+                               labels=partitioned_labels,
                                covariates=partitioned_covariates)
         else:
             docs = [doc.split() for doc in docs]
+            unprocessed_docs = documents[documents['id'].isin(ids)]['text'].tolist()
             if self.save_original_indexes:
-                return Dataset(docs, vocabulary=vocabulary, metadata=metadata, labels=labels, covariates=covariates,
+                return Dataset(docs, raw_corpus=unprocessed_docs, vocabulary=vocabulary, metadata=metadata,
+                               labels=labels, covariates=covariates,
                                document_indexes=ids)
             else:
 
-                return Dataset(docs, vocabulary=vocabulary, metadata=metadata, labels=labels, covariates=covariates)
+                return Dataset(docs, raw_corpus=unprocessed_docs, vocabulary=vocabulary, metadata=metadata,
+                               labels=labels, covariates=covariates)
 
+    # TODO:: refactor
     def read_labels_list(self, documents, labels_names):
+        """
+        Read label fields in documents and combine them into list. Each document is associated with a list of labels
+        :param documents: Pandas Dataframe, the set of documents. Each row in the dataframe represents a document
+        :param labels_names: list of label fields to be extracted from documents.
+        :return: List of label corresponding to document
+        """
         labels_list = {}
         if type(labels_names) == str:
             if ',' in labels_names:
                 labels_names = labels_names.split(',')
             else:
                 labels_names = [labels_names]
-        if type(labels_names) == list:
-            for l in labels_names:
-                if l in documents.columns:
-                    labels = documents[l].tolist()
-                    updated_labels = []
-                    for x in labels:
-                        if type(x) == list:
-                            updated_labels.append([str(y) for y in x])
-                        else:
-                            updated_labels.append([str(x)])
-                    labels_list[l] = updated_labels
+
+        for l in labels_names:
+            if l in documents.columns:
+                documents[l].fillna('', inplace=True)
+                labels = documents[l].tolist()
+                updated_labels = []
+                for x in labels:
+                    if type(x) == list:
+                        updated_labels.append([str(y) for y in x])
+                    elif type(x) == str and x == '':
+                        updated_labels.append([])
+                    else:
+                        updated_labels.append([str(x)])
+                labels_list[l] = updated_labels
+        # x={l:[y for y in documents[l].tolist()] for l in labels_names if l in documents.columns}
         all_labels = list(map(list, zip(*[labels_list[k] for k in sorted(labels_list)])))
         final_labels = []
         for labels in all_labels:
@@ -297,7 +282,18 @@ class Preprocessing:
             final_labels.append(temp_labels)
         return final_labels
 
+    # TODO: spilt this into two methods. Take out document filtering
     def filter_labels(self, labels, docs, ids, min_label_count=None, max_label_count=None, filter_none=False):
+        """
+        Calculate labels counts in documents, then filter labels that do not meet the passed frequency criteria.
+        :param labels: List of labels associated with documents. Each entry is a list of labels ( multilables)
+        :param docs: List of documents
+        :param ids: List of document ids
+        :param min_label_count: int, exclude labels that occur in less than this number of documents
+        :param max_label_count: int, the max number of labels to be kept based on their document frequency
+        :param filter_none: bool, if True, remove documents with empty label list
+        :return: List of documents, list of labels, list of document ids
+        """
         final_docs, final_labels, document_indexes = [], [], []
         labels_to_remove = set()
         if min_label_count:
@@ -331,6 +327,11 @@ class Preprocessing:
         return final_docs, final_labels, document_indexes
 
     def filter_words(self, docs):
+        """
+        Select the vocabulary list in documents
+        :param docs:  List of documents
+        :return: Generated vocabulary list
+        """
         if self.vocabulary is not None:
             self.preprocessing_steps.append('filter words by vocabulary')
             self.preprocessing_steps.append('filter words with document frequency lower than ' + str(self.min_df) +

@@ -18,18 +18,20 @@ process = psutil.Process(os.getpid())
 
 parser = argparse.ArgumentParser(usage="Topic Modelling")
 parser.add_argument('--model-type', dest="model_type", default='Scholar', required=True,
-                    help='The type of the model to be trained: default=%default')
+                    help='The type of the model to be trained [ProdLDA|Scholar|CTM|SuperCTM] : default=%default')
 parser.add_argument('--num-topics', dest="num_topics", default=600, type=int, required=False,
                     help='The number of topics to be trained: default=%default')
 parser.add_argument('--epochs', dest="epochs", default=100, type=int, required=False,
                     help='Number of training epochs: default=%default')
 parser.add_argument('--runs', dest="runs", default=5, type=int, required=False,
                     help='Number of model runs: default=%default')
+parser.add_argument('--use-partitions', dest="use_partitions", default=False, type=bool, required=False,
+                    help='if true the model will be trained on the training set and evaluated on the test')
 parser.add_argument('--dataset-path', dest="dataset_path", required=True,
                     help='Path to training dataset: default=%default')
-parser.add_argument('--training-embeddings', dest="training", required=False,
+parser.add_argument('--training-embeddings', dest="training_embeddings", default=None, required=False,
                     help='Path to embedded training dataset: default=%default')
-parser.add_argument('--testing-embeddings', dest="testing", required=False,
+parser.add_argument('--testing-embeddings', dest="testing_embeddings", default=None, required=False,
                     help='Path to embedded test dataset: default=%default')
 parser.add_argument('--save-dir', dest="save_dir", required=False,
                     help='Directory to save model checkpoints: default=%default')
@@ -72,11 +74,18 @@ parser.add_argument('--strip-html', action="store_true", dest="strip_html", defa
                     help='Strip HTML tags: default=%default')
 parser.add_argument('--lower', action="store_true", dest="lower", default=True,
                     help='Do not lowercase text: default=%default')
-parser.add_argument('--min_chars', dest='min_chars', default=3,
+parser.add_argument('--min_chars', dest='min_chars', default=2,
                     help='Minimum token length: default=%default')
 
+models = {
+    'ProdLDA': ProdLDA,
+    'Scholar': scholar,
+    'CTM': CTM,
+    'SuperCTM': CTM
+}
 
-def run_topic_modelling(model, dataset, model_output_dir=None, evals=[], runs=5):
+
+def run_topic_modelling(TMmodel, dataset, runs=5, evals=[], parameters={}, model_output_dir=None):
     run_time = []
     evaluation_values = defaultdict(list)
 
@@ -84,12 +93,14 @@ def run_topic_modelling(model, dataset, model_output_dir=None, evals=[], runs=5)
         print('----------------------------')
         print(f'        Run # {r}')
         print('----------------------------')
-
-        print("Starting Training. Current Time =", datetime.now().strftime("%H:%M:%S"))
         start_time = time.time()
+        model = TMmodel(**parameters)
+        print("Starting Training. Current Time =", datetime.now().strftime("%H:%M:%S"))
         model_output = model.train_model(dataset=dataset)
         utils.save_model_output(model_output, r, model_output_dir)
-        # del model  # Delete Trained Model to free memory
+        # Temp Code
+        utils.save_document_embed(model_output, dataset.get_document_indexes(), r, model_output_dir)
+        del model
         print("Finished Training in {}".format(time.strftime('%H:%M:%S', time.gmtime(time.time() - start_time))))
 
         print("\nStarting Evaluation. Current Time =", datetime.now().strftime("%H:%M:%S"))
@@ -112,14 +123,6 @@ def run_topic_modelling(model, dataset, model_output_dir=None, evals=[], runs=5)
     print("Average Time per Run is %s\n\n" % (time.strftime('%H:%M:%S', time.gmtime(sum(run_time) / len(run_time)))))
 
 
-models = {
-    'ProdLDA': ProdLDA,
-    'Scholar': scholar,
-    'CTM': CTM,
-    'SuperCTM': CTM
-}
-
-
 def main(args):
     print("Get Configurations")
     configs = parser.parse_args(args)
@@ -140,21 +143,25 @@ def main(args):
                                  punctuation=string.punctuation,
                                  lemmatize=configs.lemmatize,
                                  stopword_list=configs.stopwords,
-                                 language='english', split=True, verbose=False, num_processes=None,
+                                 split=configs.use_partitions,
+                                 language='english', verbose=False, num_processes=None,
                                  save_original_indexes=True, remove_stopwords_spacy=False)
 
     dataset = preprocessor.preprocess_dataset(documents_path=configs.dataset_path)
 
     print(f"Create Model {configs.model_type}")
     parameters = utils.create_params(configs.model_type, configs)
-    model = models[configs.model_type](**parameters)
+    model = models[configs.model_type]
 
     print("Start Training and Evaluation Pipline")
-    evals = ['NPMI', 'WECoherencePairwise', 'TopicDiversity', 'InvertedRBO', 'DocPerplexity', 'WordPerplexity']
-    print('Training Model {} with {} Topics'.format(configs.model_type, configs.num_topics))
+    evals = ['NPMI', 'C_V', 'U_MASS', 'C_UCI']
 
-    run_topic_modelling(model=model,
+    print('Training Model {} with {} Topics'.format(configs.model_type, configs.num_topics))
+    model_output_dir = f'{configs.model_output}/{configs.model_type}_w_{configs.max_features}' \
+                       f'_t_{configs.num_topics}_{time.strftime("%Y%m%d%H%M")}'
+    run_topic_modelling(TMmodel=model,
                         dataset=dataset,
                         runs=configs.runs,
                         evals=evals,
-                        model_output_dir=configs.model_output)
+                        parameters=parameters,
+                        model_output_dir=model_output_dir)

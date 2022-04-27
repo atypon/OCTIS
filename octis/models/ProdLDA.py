@@ -13,5 +13,5 @@ class ProdLDA(AVITM):
                          num_neurons=num_neurons, num_samples=num_samples, use_partitions=use_partitions,
                          save_dir=save_dir)
 
-    def train_model(self, dataset, hyperparameters=None, top_words=10, results_dir=None):
-        return super().train_model(dataset, hyperparameters, top_words, results_dir)
+    def train_model(self, dataset, hyperparameters=None, top_words=10):
+        return super().train_model(dataset, hyperparameters, top_words)

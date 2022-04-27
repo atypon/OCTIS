@@ -14,7 +14,7 @@ class Dataset:
     Dataset handles a dataset and offers methods to access, save and edit the dataset data
     """
 
-    def __init__(self, corpus=None, vocabulary=None, labels=None, covariates=None, metadata=None,
+    def __init__(self, corpus=None, raw_corpus=None, vocabulary=None, labels=None, covariates=None, metadata=None,
                  document_indexes=None):
         """
         Initialize a dataset, parameters are optional
@@ -28,6 +28,7 @@ class Dataset:
         metadata : metadata of the dataset
         """
         self.__corpus = corpus
+        self.__raw_corpus = raw_corpus
         self.__vocabulary = vocabulary
         self.__metadata = metadata
         self.__labels = labels
@@ -35,9 +36,6 @@ class Dataset:
         self.__original_indexes = document_indexes
         self.dataset_path = None
         self.is_cached = False
-
-    def get_corpus(self):
-        return self.__corpus
 
     # Partitioned Corpus getter
     def get_partitioned_corpus(self, use_validation=True):
@@ -104,6 +102,18 @@ class Dataset:
                     else:
                         test_indices = list(range(last_training_doc, len(self.__corpus)))
         return train_indices, test_indices, valid_indices
+
+    # Corpus getter
+    def get_raw_corpus(self):
+        return self.__raw_corpus
+
+    # Corpus getter
+    def get_corpus(self):
+        return self.__corpus
+
+    # Indexes getter
+    def get_document_indexes(self):
+        return self.__original_indexes
 
     # Edges getter
     def get_edges(self):
@@ -177,6 +187,21 @@ class Dataset:
             self.__corpus = corpus
         else:
             raise Exception("error in loading corpus")
+
+    def _load_raw_corpus(self, file_name):
+        """
+        Loads raw corpus from a file
+        Parameters
+        ----------
+        file_name : name of the file to read
+        """
+        file = Path(file_name)
+        if file.is_file():
+            with open(file_name, 'r') as corpus_file:
+                corpus = [line.strip().split() for line in corpus_file]
+            self.__raw_corpus = corpus
+        else:
+            raise Exception("error in loading raw corpus")
 
     def _save_edges(self, file_name):
         """
@@ -313,7 +338,7 @@ class Dataset:
         else:
             raise Exception("error in loading vocabulary")
 
-    def save(self, path, multilabel=False):
+    def save(self, path):
         """
         Saves all the dataset info in a folder
         Parameters
@@ -340,12 +365,9 @@ class Dataset:
             df = pd.DataFrame(data=corpus)
             df = pd.concat([df, pd.DataFrame(partition)], axis=1)
 
-            if multilabel:
-                labs = [' '.join(lab) for lab in self.__labels]
-            else:
-                labs = self.__labels
+            labs = [' '.join(lab) for lab in self.__labels]
 
-            covars = labs = [' '.join(lab) for lab in self.__covariates]
+            covars = [' '.join(lab) for lab in self.__covariates]
 
             if self.__labels:
                 df = pd.concat([df, pd.DataFrame(labs), pd.DataFrame(covars)], axis=1)
@@ -359,6 +381,7 @@ class Dataset:
         except:
             raise Exception("error in saving the dataset")
 
+    # TODO :: update this method to load labels, covaraites, and edges
     def load_custom_dataset_from_folder(self, path, multilabel=False):
         """
         Loads all the dataset from a folder
@@ -442,6 +465,7 @@ class Dataset:
                 raise IOError(dataset_name + ' dataset not found')
         self.is_cached = True
         self.__corpus = [d.split() for d in cache["corpus"]]
+        self.__raw_corpus = cache["raw_corpus"]
         self.__vocabulary = cache["vocabulary"]
         self.__metadata = cache["metadata"]
         self.dataset_path = cache_path

@@ -117,8 +117,8 @@ class DecoderNetwork(nn.Module):
             # in: batch_size x input_size x n_components
             word_dist = F.softmax(
                 self.beta_batchnorm(torch.matmul(theta, self.beta)), dim=1)
-            topic_word = self.beta
             # word_dist: batch_size x input_size
+            topic_word = self.beta
             self.topic_word_matrix = self.beta
         elif self.model_type == 'LDA':
             # simplex constrain on Beta

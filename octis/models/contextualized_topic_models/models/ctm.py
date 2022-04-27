@@ -5,6 +5,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 from torch import optim
+from tqdm import tqdm
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
@@ -16,15 +17,16 @@ class CTM(object):
     """Class to train the contextualized topic model
     """
 
-    def __init__(self, input_size, bert_input_size, inference_type="zeroshot", num_topics=10, model_type='prodLDA',
+    def __init__(self, input_size, bert_input_size, inference_type="combined", model_type='prodLDA', n_components=10,
                  hidden_sizes=(100, 100), activation='softplus', dropout=0.2, learn_priors=True, batch_size=64,
                  lr=2e-3, momentum=0.99, solver='adam', num_epochs=100, num_samples=10,
-                 reduce_on_plateau=False, topic_prior_mean=0.0, topic_prior_variance=None, num_data_loader_workers=0):
+                 reduce_on_plateau=False, topic_prior_mean=0.0, topic_prior_variance=None, num_data_loader_workers=0,
+                 label_size=0, loss_weights=None):
         """
         :param input_size: int, dimension of input
         :param bert_input_size: int, dimension of input that comes from BERT embeddings
         :param inference_type: string, you can choose between the contextual model and the combined model
-        :param num_topics: int, number of topic components, (default 10)
+        :param n_components: int, number of topic components, (default 10)
         :param model_type: string, 'prodLDA' or 'LDA' (default 'prodLDA')
         :param hidden_sizes: tuple, length = n_layers, (default (100, 100))
         :param activation: string, 'softplus', 'relu', 'sigmoid', 'swish', 'tanh', 'leakyrelu', 'rrelu', 'elu',
@@ -39,12 +41,20 @@ class CTM(object):
         :param num_epochs: int, number of epochs to train for, (default 100)
         :param reduce_on_plateau: bool, reduce learning rate by 10x on plateau of 10 epochs (default False)
         :param num_data_loader_workers: int, number of data loader workers (default cpu_count). set it to 0 if you are using Windows
+        :param label_size: int, number of total labels (default: 0)
+        :param loss_weights: dict, it contains the name of the weight parameter (key) and the weight (value) for each loss.
         """
+
+        self.device = (
+            torch.device("cuda")
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
 
         assert isinstance(input_size, int) and input_size > 0, \
             "input_size must by type int > 0."
-        assert (isinstance(num_topics, int) or isinstance(num_topics, np.int64)) and num_topics > 0, \
-            "num_topics must by type int > 0."
+        assert (isinstance(n_components, int) or isinstance(n_components, np.int64)) and n_components > 0, \
+            "n_components must by type int > 0."
         assert model_type in ['LDA', 'prodLDA'], \
             "model must be 'LDA' or 'prodLDA'."
         assert isinstance(hidden_sizes, tuple), \
@@ -71,7 +81,7 @@ class CTM(object):
         #    "topic prior_variance must be type float"
 
         self.input_size = input_size
-        self.num_topics = num_topics
+        self.n_components = n_components
         self.model_type = model_type
         self.hidden_sizes = hidden_sizes
         self.activation = activation
@@ -88,11 +98,19 @@ class CTM(object):
         self.num_data_loader_workers = num_data_loader_workers
         self.topic_prior_mean = topic_prior_mean
         self.topic_prior_variance = topic_prior_variance
+
+        if loss_weights:
+            self.weights = loss_weights
+        else:
+            self.weights = {"beta": 1}
+
         # init inference avitm network
         self.model = DecoderNetwork(
-            input_size, self.bert_size, inference_type, num_topics, model_type, hidden_sizes, activation,
-            dropout, self.learn_priors, self.topic_prior_mean, self.topic_prior_variance)
+            input_size, self.bert_size, inference_type, n_components, model_type, hidden_sizes, activation,
+            dropout, self.learn_priors, self.topic_prior_mean, self.topic_prior_variance, label_size=label_size)
+
         self.early_stopping = EarlyStopping(patience=5, verbose=False)
+
         # init optimizer
         if self.solver == 'adam':
             self.optimizer = optim.Adam(self.model.parameters(), lr=lr, betas=(self.momentum, 0.99))
@@ -104,6 +122,7 @@ class CTM(object):
             self.optimizer = optim.Adadelta(self.model.parameters(), lr=lr)
         elif self.solver == 'rmsprop':
             self.optimizer = optim.RMSprop(self.model.parameters(), lr=lr, momentum=self.momentum)
+
         # init lr scheduler
         if self.reduce_on_plateau:
             self.scheduler = ReduceLROnPlateau(self.optimizer, patience=10)
@@ -115,6 +134,9 @@ class CTM(object):
         self.model_dir = None
         self.train_data = None
         self.nn_epoch = None
+
+        # validation attributes
+        self.validation_data = None
 
         # learned topics
         self.best_components = None
@@ -140,12 +162,13 @@ class CTM(object):
         logvar_det_division = \
             prior_variance.log().sum() - posterior_log_variance.sum(dim=1)
         # combine terms
-        KL = 0.5 * (var_division + diff_term - self.num_topics + logvar_det_division)
+        KL = 0.5 * (var_division + diff_term - self.n_components + logvar_det_division)
         # Reconstruction term
         RL = -torch.sum(inputs * torch.log(word_dists + 1e-10), dim=1)
-        loss = KL + RL
-
-        return loss.sum()
+        # loss = KL + RL
+        #
+        # return loss.sum()
+        return KL, RL
 
     def _train_epoch(self, loader):
         """Train epoch."""
@@ -158,6 +181,14 @@ class CTM(object):
             X = batch_samples['X']
             X = X.reshape(X.shape[0], -1)
             X_bert = batch_samples['X_bert']
+
+            if "labels" in batch_samples.keys():
+                labels = batch_samples["labels"]
+                labels = labels.reshape(labels.shape[0], -1)
+                labels = labels.to(self.device)
+            else:
+                labels = None
+
             if self.USE_CUDA:
                 X = X.cuda()
                 X_bert = X_bert.cuda()
@@ -166,12 +197,22 @@ class CTM(object):
             self.model.zero_grad()
             prior_mean, prior_variance, \
             posterior_mean, posterior_variance, posterior_log_variance, \
-            word_dists, topic_word, topic_document = self.model(X, X_bert)
+            word_dists, topic_word, topic_document, estimated_labels = self.model(X, X_bert, labels)
             topic_doc_list.extend(topic_document)
 
             # backward pass
-            loss = self._loss(X, word_dists, prior_mean, prior_variance,
-                              posterior_mean, posterior_variance, posterior_log_variance)
+            kl_loss, rl_loss = self._loss(X, word_dists, prior_mean, prior_variance,
+                                          posterior_mean, posterior_variance, posterior_log_variance)
+
+            loss = self.weights["beta"] * kl_loss + rl_loss
+            loss = loss.sum()
+
+            if labels is not None:
+                target_labels = torch.argmax(labels, 1)
+
+                label_loss = torch.nn.CrossEntropyLoss()(estimated_labels, target_labels)
+                loss += label_loss
+
             loss.backward()
             self.optimizer.step()
 
@@ -182,38 +223,6 @@ class CTM(object):
         train_loss /= samples_processed
 
         return samples_processed, train_loss, topic_word, topic_doc_list
-
-    def _validation(self, loader):
-        """Train epoch."""
-        self.model.eval()
-        val_loss = 0
-        samples_processed = 0
-        for batch_samples in loader:
-            # batch_size x vocab_size
-            X = batch_samples['X']
-            X = X.reshape(X.shape[0], -1)
-            X_bert = batch_samples['X_bert']
-
-            if self.USE_CUDA:
-                X = X.cuda()
-                X_bert = X_bert.cuda()
-
-            # forward pass
-            self.model.zero_grad()
-            prior_mean, prior_variance, \
-            posterior_mean, posterior_variance, posterior_log_variance, \
-            word_dists, topic_word, topic_document = self.model(X, X_bert)
-
-            loss = self._loss(X, word_dists, prior_mean, prior_variance,
-                              posterior_mean, posterior_variance, posterior_log_variance)
-
-            # compute train loss
-            samples_processed += X.size()[0]
-            val_loss += loss.item()
-
-        val_loss /= samples_processed
-
-        return samples_processed, val_loss
 
     def fit(self, train_dataset, validation_dataset=None, save_dir=None, verbose=True):
         """
@@ -239,7 +248,7 @@ class CTM(object):
                    Momentum: {}\n\
                    Reduce On Plateau: {}\n\
                    Save Dir: {}".format(
-                self.num_topics, self.topic_prior_mean,
+                self.n_components, self.topic_prior_mean,
                 self.topic_prior_variance, self.model_type,
                 self.hidden_sizes, self.activation, self.dropout, self.learn_priors,
                 self.lr, self.momentum, self.reduce_on_plateau, save_dir))
@@ -256,27 +265,36 @@ class CTM(object):
         samples_processed = 0
 
         # train loop
+        pbar = tqdm(self.num_epochs, position=0, leave=True)
         for epoch in range(self.num_epochs):
             self.nn_epoch = epoch
             # train epoch
             s = datetime.datetime.now()
+            # TODO: number of outputs
             sp, train_loss, topic_word, topic_document = self._train_epoch(train_loader)
             samples_processed += sp
             e = datetime.datetime.now()
+            pbar.update(1)
 
             if verbose:
                 print("Epoch: [{}/{}]\tSamples: [{}/{}]\tTrain Loss: {}\tTime: {}".format(
                     epoch + 1, self.num_epochs, samples_processed,
                     len(self.train_data) * self.num_epochs, train_loss, e - s))
 
+            pbar.set_description(
+                "Epoch: [{}/{}]\t Seen Samples: [{}/{}]\tTrain Loss: {}\tTime: {}".format(
+                    epoch + 1, self.num_epochs, samples_processed,
+                    len(self.train_data) * self.num_epochs, train_loss, e - s))
+
+            # TODO :: whats the difference between best_components and final_topic_word
             self.best_components = self.model.beta
             self.final_topic_word = topic_word
             self.final_topic_document = topic_document
             self.best_loss_train = train_loss
+
             if self.validation_data is not None:
-                validation_loader = DataLoader(
-                    self.validation_data, batch_size=self.batch_size, shuffle=True,
-                    num_workers=self.num_data_loader_workers)
+                validation_loader = DataLoader(self.validation_data, batch_size=self.batch_size, shuffle=True,
+                                               num_workers=self.num_data_loader_workers)
                 # train epoch
                 s = datetime.datetime.now()
                 val_samples_processed, val_loss = self._validation(validation_loader)
@@ -286,6 +304,11 @@ class CTM(object):
                     print("Epoch: [{}/{}]\tSamples: [{}/{}]\tValidation Loss: {}\tTime: {}".format(
                         epoch + 1, self.num_epochs, val_samples_processed,
                         len(self.validation_data) * self.num_epochs, val_loss, e - s))
+
+                pbar.set_description(
+                    "Epoch: [{}/{}]\t Seen Samples: [{}/{}]\tTrain Loss: {}\tValid Loss: {}\tTime: {}".format(
+                        epoch + 1, self.num_epochs, samples_processed,
+                        len(self.train_data) * self.num_epochs, train_loss, val_loss, e - s))
 
                 if np.isnan(val_loss) or np.isnan(train_loss):
                     break
@@ -297,6 +320,149 @@ class CTM(object):
                         if save_dir is not None:
                             self.save(save_dir)
                         break
+        pbar.close()
+        # self.training_doc_topic_distributions = self.get_doc_topic_distribution(train_dataset, n_samples)
+
+    def _validation(self, loader):
+        """Train epoch."""
+        self.model.eval()
+        val_loss = 0
+        samples_processed = 0
+        for batch_samples in loader:
+            # batch_size x vocab_size
+            X = batch_samples['X']
+            X = X.reshape(X.shape[0], -1)
+            X_bert = batch_samples['X_bert']
+
+            if "labels" in batch_samples.keys():
+                labels = batch_samples["labels"]
+                labels = labels.to(self.device)
+                labels = labels.reshape(labels.shape[0], -1)
+            else:
+                labels = None
+
+            if self.USE_CUDA:
+                X = X.cuda()
+                X_bert = X_bert.cuda()
+
+            # forward pass
+            self.model.zero_grad()
+            prior_mean, prior_variance, \
+            posterior_mean, posterior_variance, posterior_log_variance, \
+            word_dists, topic_word, topic_document, estimated_labels = self.model(X, X_bert, labels)
+
+            kl_loss, rl_loss = self._loss(X, word_dists, prior_mean, prior_variance,
+                                          posterior_mean, posterior_variance, posterior_log_variance)
+
+            loss = self.weights["beta"] * kl_loss + rl_loss
+            loss = loss.sum()
+
+            if labels is not None:
+                target_labels = torch.argmax(labels, 1)
+                label_loss = torch.nn.CrossEntropyLoss()(estimated_labels, target_labels)
+                loss += label_loss
+
+            # compute train loss
+            samples_processed += X.size()[0]
+            val_loss += loss.item()
+
+        val_loss /= samples_processed
+
+        return samples_processed, val_loss
+
+    def _doc_perplexity(self, dataset):
+
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False,
+                            num_workers=self.num_data_loader_workers)
+        self.model.eval()
+        perplexity = None
+        samples_processed = 0
+        with torch.no_grad():
+            for batch_samples in loader:
+                # batch_size x vocab_size
+                X = batch_samples['X']
+                X = X.reshape(X.shape[0], -1)
+                X_bert = batch_samples['X_bert']
+
+                if "labels" in batch_samples.keys():
+                    labels = batch_samples["labels"]
+                    labels = labels.to(self.device)
+                    labels = labels.reshape(labels.shape[0], -1)
+                else:
+                    labels = None
+
+                if self.USE_CUDA:
+                    X = X.cuda()
+                    X_bert = X_bert.cuda()
+
+                # forward pass
+                self.model.zero_grad()
+                prior_mean, prior_variance, posterior_mean, posterior_variance, posterior_log_variance, word_dists, \
+                topic_word, topic_document, estimated_labels = self.model(X, X_bert, labels)
+
+                kl_loss, rl_loss = self._loss(X, word_dists, prior_mean, prior_variance,
+                                              posterior_mean, posterior_variance, posterior_log_variance)
+
+                loss = self.weights["beta"] * kl_loss + rl_loss
+                # loss = loss.sum()
+
+                if labels is not None:
+                    target_labels = torch.argmax(labels, 1)
+                    label_loss = torch.nn.CrossEntropyLoss()(estimated_labels, target_labels)
+                    loss += label_loss
+
+                if perplexity is None:
+                    perplexity = loss
+                else:
+                    perplexity = np.concatenate((perplexity, loss), axis=0)
+
+                # compute train loss
+        return perplexity
+
+    def _word_perplexity(self, dataset, test_dataset):
+
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False,
+                            num_workers=self.num_data_loader_workers)
+        loader_test = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False,
+                                 num_workers=self.num_data_loader_workers)
+
+        self.model.eval()
+        word_perplexity = None
+        with torch.no_grad():
+            for batch_samples, test_samples in zip(loader, loader_test):
+                # batch_size x vocab_size
+                X = batch_samples['X']
+                X = X.reshape(X.shape[0], -1)
+                X_bert = batch_samples['X_bert']
+
+                X_test = test_samples['X']
+                X_test = X_test.reshape(X_test.shape[0], -1)
+
+                if "labels" in batch_samples.keys():
+                    labels = batch_samples["labels"]
+                    labels = labels.to(self.device)
+                    labels = labels.reshape(labels.shape[0], -1)
+                else:
+                    labels = None
+
+                if self.USE_CUDA:
+                    X = X.cuda()
+                    X_test = X_test.cuda()
+                    X_bert = X_bert.cuda()
+
+                # forward pass
+                self.model.zero_grad()
+                prior_mean, prior_variance, posterior_mean, posterior_variance, posterior_log_variance, word_dists, \
+                topic_word, topic_document, estimated_labels = self.model(X, X_bert, labels)
+
+                rl_loss = -torch.sum(X_test * torch.log(word_dists + 1e-10), dim=1)
+
+                if word_perplexity is None:
+                    word_perplexity = rl_loss
+                else:
+                    word_perplexity = np.concatenate((word_perplexity, rl_loss), axis=0)
+
+        return word_perplexity
 
     def predict(self, dataset):
         """Predict input."""
@@ -327,6 +493,10 @@ class CTM(object):
         return results
 
     def get_topic_word_mat(self):
+        """
+        Return the topic-word matrix (dimensions: number of topics x length of the vocabulary).
+        If model_type is LDA, the matrix is normalized; otherwise the matrix is unnormalized.
+        """
         top_wor = self.final_topic_word.cpu().detach().numpy()
         return top_wor
 
@@ -346,8 +516,8 @@ class CTM(object):
         component_dists = self.best_components
         topics = defaultdict(list)
         topics_list = []
-        if self.num_topics is not None:
-            for i in range(self.num_topics):
+        if self.n_components is not None:
+            for i in range(self.n_components):
                 _, idxs = torch.topk(component_dists[i], k)
                 component_words = [self.train_data.idx2token[idx]
                                    for idx in idxs.cpu().numpy()]
@@ -360,17 +530,22 @@ class CTM(object):
         info = {}
         topic_word = self.get_topics()
         topic_word_dist = self.get_topic_word_mat()
-        topic_document_dist = self.get_topic_document_mat()
+        # topic_document_dist = self.get_topic_document_mat()
         info['topics'] = topic_word
-
         info['topic-document-matrix'] = np.asarray(self.get_thetas(self.train_data)).T
-
         info['topic-word-matrix'] = topic_word_dist
         return info
 
+    def predict(self, dataset, rec_bow, test_bow):
+        results = self.get_info()
+        results['test-topic-document-matrix'] = np.asarray(self.get_thetas(dataset)).T
+        results['doc-losses'] = self._doc_perplexity(rec_bow)
+        results['word-losses'] = self._word_perplexity(rec_bow, test_bow)
+        return results
+
     def _format_file(self):
         model_dir = "AVITM_nc_{}_tpm_{}_tpv_{}_hs_{}_ac_{}_do_{}_lr_{}_mo_{}_rp_{}". \
-            format(self.num_topics, 0.0, 1 - (1. / self.num_topics),
+            format(self.n_components, 0.0, 1 - (1. / self.n_components),
                    self.model_type, self.hidden_sizes, self.activation,
                    self.dropout, self.lr, self.momentum,
                    self.reduce_on_plateau)
@@ -411,31 +586,60 @@ class CTM(object):
 
         self.model.load_state_dict(checkpoint['state_dict'])
 
-    def get_thetas(self, dataset):
+    def get_thetas(self, dataset, n_samples=20):
         """
         Get the document-topic distribution for a dataset of topics. Includes multiple sampling to reduce variation via
-        the parameter num_samples.
+        the parameter n_sample.
+
         :param dataset: a PyTorch Dataset containing the documents
+        :param n_samples: the number of sample to collect to estimate the final distribution (the more the better).
+        """
+        return self.get_doc_topic_distribution(dataset, n_samples=n_samples)
+
+    def get_doc_topic_distribution(self, dataset, n_samples=20):
+        """
+        Get the document-topic distribution for a dataset of topics. Includes multiple sampling to reduce variation via
+        the parameter n_sample.
+
+        :param dataset: a PyTorch Dataset containing the documents
+        :param n_samples: the number of sample to collect to estimate the final distribution (the more the better).
         """
         self.model.eval()
 
         loader = DataLoader(
-            dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_data_loader_workers)
-        final_thetas = []
-        for sample_index in range(self.num_samples):
+            dataset, batch_size=self.batch_size, shuffle=False,
+            num_workers=self.num_data_loader_workers)
+        pbar = tqdm(n_samples, position=0, leave=True)
+        final_thetas = None
+        for sample_index in range(n_samples):
             with torch.no_grad():
                 collect_theta = []
                 for batch_samples in loader:
                     # batch_size x vocab_size
-                    x = batch_samples['X']
-                    x = x.reshape(x.shape[0], -1)
-                    x_bert = batch_samples['X_bert']
+                    X = batch_samples['X']
+                    X = X.reshape(X.shape[0], -1)
+                    X_bert = batch_samples['X_bert']
+
+                    if "labels" in batch_samples.keys():
+                        labels = batch_samples["labels"]
+                        labels = labels.to(self.device)
+                        labels = labels.reshape(labels.shape[0], -1)
+                    else:
+                        labels = None
+
                     if self.USE_CUDA:
-                        x = x.cuda()
-                        x_bert = x_bert.cuda()
+                        X = X.cuda()
+                        X_bert = X_bert.cuda()
+
                     # forward pass
                     self.model.zero_grad()
-                    collect_theta.extend(self.model.get_theta(x, x_bert).cpu().numpy().tolist())
+                    collect_theta.extend(self.model.get_theta(X, X_bert, labels).cpu().numpy().tolist())
 
-                final_thetas.append(np.array(collect_theta))
-        return np.sum(final_thetas, axis=0) / self.num_samples
+                pbar.update(1)
+                pbar.set_description("Sampling: [{}/{}]".format(sample_index + 1, n_samples))
+                if final_thetas is None:
+                    final_thetas = np.array(collect_theta)
+                else:
+                    final_thetas = final_thetas + np.array(collect_theta)
+        pbar.close()
+        return final_thetas / n_samples

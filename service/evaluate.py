@@ -31,7 +31,7 @@ class WordPerplexity(AbstractMetric):
 
 Evaluations = {
     'F1': F1Score,
-    'Precision': F1Score,
+    'Precision': PrecisionScore,
     'Recall': RecallScore,
     'Accuracy': AccuracyScore,
     'NPMI': Coherence,
