@@ -145,7 +145,7 @@ class Preprocessing:
         self.remove_alphanum = remove_alphanum
         self.strip_html = strip_html
 
-    def preprocess_dataset(self, documents_path):
+    def preprocess_dataset(self, documents=None, documents_path=None):
         """
         preprocess the input dataset
 
@@ -154,8 +154,10 @@ class Preprocessing:
 
         :return octis.dataset.dataset.Dataset
         """
+        assert documents is None and documents_path is None, 'You should either pass a document set or path to dataset'
+        if documents is None:
+            documents = pd.DataFrame.from_records(fh.read_jsonlist(documents_path))
 
-        documents = pd.DataFrame.from_records(fh.read_jsonlist(documents_path))
         ids, docs, labels, covariates = documents['id'].tolist(), documents['text'].tolist(), None, None
 
         # Read Labels and Covariates
