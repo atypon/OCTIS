@@ -29,7 +29,7 @@ class Preprocessing:
     def __init__(self, lowercase: bool = True, vocabulary: List[str] = None, max_features: int = None,
                  min_df: float = 0.0, max_df: float = 1.0, remove_punctuation: bool = True,
                  punctuation: str = string.punctuation, remove_numbers: bool = True,
-                 lemmatize: bool = True, stopword_list: Union[str, List[str]] = None, min_chars: int = 1,
+                 lemmatize: bool = True, stopword_list: Union[str, List[str]] = 'english', min_chars: int = 1,
                  min_words_docs: int = 0, language: str = 'english', split: bool = True, verbose: bool = False,
                  num_processes: int = None, save_original_indexes=True, remove_stopwords_spacy: bool = True,
                  labels: List[str] = None, covariates: List[str] = None,
@@ -63,7 +63,7 @@ class Preprocessing:
         :type lemmatize: bool
         :param stopword_list: if a list of strings is passed, the strings will be removed from the texts. Otherwise,
         if a str is passed, it represents the language of the stopwords that need to be removed. The stopwords are
-        spacy's stopwords (default: None)
+        spacy's stopwords (default: english)
         :type stopword_list: str or list of str
         :param min_chars: mininum number of characters that a token should have (default: 1)
         :type min_chars: int
@@ -154,7 +154,7 @@ class Preprocessing:
 
         :return octis.dataset.dataset.Dataset
         """
-        assert documents is None and documents_path is None, 'You should either pass a document set or path to dataset'
+        assert documents is not None or documents_path is not None, 'You should either pass a document set or path to dataset'
         if documents is None:
             documents = pd.DataFrame.from_records(fh.read_jsonlist(documents_path))
 
@@ -300,32 +300,24 @@ class Preprocessing:
         labels_to_remove = set()
         if min_label_count:
             all_labels = [x.lower() for y in labels for x in y]
-            labels_to_remove = set([k for k, v in dict(Counter(all_labels)).items() if v <= min_label_count])
+            u_labels = set([k for k, v in dict(Counter(all_labels)).items() if v >= min_label_count])
+            labels_list = [[x for x in labels if x in u_labels] for labels in labels]
 
         elif max_label_count:
             label_vectorizer = CountVectorizer(max_features=max_label_count, stop_words=self.stopwords)
             all_labels = [x.lower() for y in labels for x in y]
             label_vectorizer.fit_transform(all_labels)
             u_labels = set(label_vectorizer.get_feature_names())
-            labels_to_remove = list(set(all_labels).difference(set(u_labels)))
+            labels_list = [[x for x in labels if x in u_labels] for labels in labels]
 
-        if len(labels_to_remove) > 0:
-            for i, doc, label in zip(ids, docs, labels):
-                doc_final_labels = []
-                for l in label:
-                    if l not in labels_to_remove:
-                        doc_final_labels.append(l)
-                # if doc_final_labels:
-                if filter_none and not doc_final_labels:
-                    pass
-                else:
-                    final_docs.append(doc)
-                    final_labels.append(doc_final_labels)
-                    document_indexes.append(i)
-        else:
-            final_docs = docs
-            final_labels = labels
-            document_indexes = ids
+        for i, doc, label in zip(ids, docs, labels_list):
+            if filter_none and not label:
+                pass
+            else:
+                final_docs.append(doc)
+                final_labels.append(label)
+                document_indexes.append(i)
+
         return final_docs, final_labels, document_indexes
 
     def filter_words(self, docs):
